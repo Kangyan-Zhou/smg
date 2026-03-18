@@ -80,6 +80,7 @@ impl PipelineStage for HarmonyResponseProcessingStage {
                             execution_result,
                             ctx.chat_request_arc(),
                             dispatch,
+                            ctx.state.pipeline_start,
                         );
 
                     // Attach load guards to response body for proper RAII lifecycle

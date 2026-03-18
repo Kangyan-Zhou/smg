@@ -75,6 +75,7 @@ impl HarmonyStreamingProcessor {
         execution_result: context::ExecutionResult,
         chat_request: Arc<ChatCompletionRequest>,
         dispatch: context::DispatchMetadata,
+        pipeline_start: Option<Instant>,
     ) -> Response {
         // Create SSE channel
         let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
@@ -83,8 +84,14 @@ impl HarmonyStreamingProcessor {
         match execution_result {
             context::ExecutionResult::Single { stream } => {
                 tokio::spawn(async move {
-                    let result =
-                        Self::process_single_stream(stream, dispatch, chat_request, &tx).await;
+                    let result = Self::process_single_stream(
+                        stream,
+                        dispatch,
+                        chat_request,
+                        &tx,
+                        pipeline_start,
+                    )
+                    .await;
 
                     if let Err(e) = result {
                         error!("Harmony streaming error: {}", e);
@@ -96,9 +103,15 @@ impl HarmonyStreamingProcessor {
             }
             context::ExecutionResult::Dual { prefill, decode } => {
                 tokio::spawn(async move {
-                    let result =
-                        Self::process_dual_stream(prefill, *decode, dispatch, chat_request, &tx)
-                            .await;
+                    let result = Self::process_dual_stream(
+                        prefill,
+                        *decode,
+                        dispatch,
+                        chat_request,
+                        &tx,
+                        pipeline_start,
+                    )
+                    .await;
 
                     if let Err(e) = result {
                         error!("Harmony dual streaming error: {}", e);
@@ -129,6 +142,7 @@ impl HarmonyStreamingProcessor {
         dispatch: context::DispatchMetadata,
         original_request: Arc<ChatCompletionRequest>,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+        pipeline_start: Option<Instant>,
     ) -> Result<(), String> {
         let mut prompt_tokens = HashMap::new();
         let mut cached_tokens = HashMap::new();
@@ -139,6 +153,7 @@ impl HarmonyStreamingProcessor {
             tx,
             &mut prompt_tokens,
             &mut cached_tokens,
+            pipeline_start,
         )
         .await
     }
@@ -150,6 +165,7 @@ impl HarmonyStreamingProcessor {
         dispatch: context::DispatchMetadata,
         original_request: Arc<ChatCompletionRequest>,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+        pipeline_start: Option<Instant>,
     ) -> Result<(), String> {
         // Phase 1: Process prefill stream (collect metadata)
         let mut prompt_tokens: HashMap<u32, u32> = HashMap::new();
@@ -172,6 +188,7 @@ impl HarmonyStreamingProcessor {
             tx,
             &mut prompt_tokens,
             &mut cached_tokens,
+            pipeline_start,
         )
         .await?;
 
@@ -194,10 +211,13 @@ impl HarmonyStreamingProcessor {
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
         prompt_tokens: &mut HashMap<u32, u32>,
         cached_tokens: &mut HashMap<u32, u32>,
+        pipeline_start: Option<Instant>,
     ) -> Result<(), String> {
         // Timing for metrics
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
+        let mut last_token_time: Option<Instant> = None;
+        let mut itl_observations: Vec<(f64, u64)> = Vec::new();
 
         // Per-index state management (for n>1 support)
         let mut parsers: HashMap<u32, HarmonyParserAdapter> = HashMap::new();
@@ -215,10 +235,18 @@ impl HarmonyStreamingProcessor {
                 ProtoResponseVariant::Chunk(chunk_wrapper) => {
                     let index = chunk_wrapper.index();
 
-                    // Track first token time for TTFT metric
+                    // Track TTFT and ITL timing
+                    let now = Instant::now();
                     if first_token_time.is_none() {
-                        first_token_time = Some(Instant::now());
+                        first_token_time = Some(now);
+                    } else if let Some(last) = last_token_time {
+                        let num_tokens = chunk_wrapper.token_ids().len() as u64;
+                        if num_tokens > 0 {
+                            let interval = now.duration_since(last).as_secs_f64();
+                            itl_observations.push((interval / num_tokens as f64, num_tokens));
+                        }
                     }
+                    last_token_time = Some(now);
 
                     // Initialize parser for this index if needed
                     if let Vacant(e) = parsers.entry(index) {
@@ -334,6 +362,9 @@ impl HarmonyStreamingProcessor {
             generation_duration: start_time.elapsed(),
             input_tokens: Some(total_prompt as u64),
             output_tokens: total_completion as u64,
+            itl_observations: &itl_observations,
+            e2e_latency: pipeline_start.map(|ps| ps.elapsed()),
+            queue_time: pipeline_start.map(|ps| start_time.saturating_duration_since(ps)),
         });
 
         Ok(())

@@ -55,6 +55,7 @@ struct GenerateStreamContext {
     return_logprob: bool,
     backend_type: &'static str,
     model: String,
+    pipeline_start: Option<Instant>,
 }
 
 impl StreamingProcessor {
@@ -89,6 +90,7 @@ impl StreamingProcessor {
         chat_request: Arc<ChatCompletionRequest>,
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
+        pipeline_start: Option<Instant>,
     ) -> Response {
         use bytes::Bytes;
         use tokio::sync::mpsc;
@@ -122,6 +124,7 @@ impl StreamingProcessor {
                             stop_params,
                             chat_request,
                             &tx,
+                            pipeline_start,
                         )
                         .await;
 
@@ -149,6 +152,7 @@ impl StreamingProcessor {
                             stop_params,
                             chat_request,
                             &tx,
+                            pipeline_start,
                         )
                         .await;
 
@@ -174,6 +178,7 @@ impl StreamingProcessor {
     }
 
     /// Process streaming chunks from a single stream (Regular mode)
+    #[expect(clippy::too_many_arguments)]
     pub async fn process_streaming_chunks(
         &self,
         mut grpc_stream: ProtoStream,
@@ -182,10 +187,13 @@ impl StreamingProcessor {
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
         original_request: Arc<ChatCompletionRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
+        pipeline_start: Option<Instant>,
     ) -> Result<(), String> {
         // Metrics timing
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
+        let mut last_token_time: Option<Instant> = None;
+        let mut itl_observations: Vec<(f64, u64)> = Vec::new();
 
         // Extract request parameters
         let separate_reasoning = original_request.separate_reasoning;
@@ -269,10 +277,18 @@ impl StreamingProcessor {
 
             match gen_response.into_response() {
                 ProtoResponseVariant::Chunk(chunk) => {
-                    // Track TTFT immediately on first chunk received from backend
+                    // Track TTFT and ITL timing
+                    let now = Instant::now();
                     if first_token_time.is_none() {
-                        first_token_time = Some(Instant::now());
+                        first_token_time = Some(now);
+                    } else if let Some(last) = last_token_time {
+                        let num_tokens = chunk.token_ids().len() as u64;
+                        if num_tokens > 0 {
+                            let interval = now.duration_since(last).as_secs_f64();
+                            itl_observations.push((interval / num_tokens as f64, num_tokens));
+                        }
                     }
+                    last_token_time = Some(now);
 
                     let index = chunk.index();
 
@@ -558,6 +574,9 @@ impl StreamingProcessor {
             generation_duration: start_time.elapsed(),
             input_tokens: Some(total_prompt as u64),
             output_tokens: total_completion as u64,
+            itl_observations: &itl_observations,
+            e2e_latency: pipeline_start.map(|ps| ps.elapsed()),
+            queue_time: pipeline_start.map(|ps| start_time.saturating_duration_since(ps)),
         });
 
         Ok(())
@@ -574,6 +593,7 @@ impl StreamingProcessor {
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
         original_request: Arc<ChatCompletionRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
+        pipeline_start: Option<Instant>,
     ) -> Result<(), String> {
         // Phase 1.5: Collect input_logprobs from prefill stream if requested
         if original_request.logprobs {
@@ -604,6 +624,7 @@ impl StreamingProcessor {
                 stop_params,
                 original_request,
                 tx,
+                pipeline_start,
             )
             .await;
 
@@ -628,6 +649,7 @@ impl StreamingProcessor {
         generate_request: Arc<GenerateRequest>,
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
+        pipeline_start: Option<Instant>,
     ) -> Response {
         // Create SSE channel
         let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
@@ -642,6 +664,7 @@ impl StreamingProcessor {
             return_logprob: generate_request.return_logprob.unwrap_or(false),
             backend_type: self.backend_type,
             model: dispatch.model.clone(),
+            pipeline_start,
         };
 
         // Spawn background task based on execution mode
@@ -707,6 +730,8 @@ impl StreamingProcessor {
     ) -> Result<(), String> {
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
+        let mut last_token_time: Option<Instant> = None;
+        let mut itl_observations: Vec<(f64, u64)> = Vec::new();
 
         // Track state per index for n>1 case
         let mut accumulated_texts: HashMap<u32, String> = HashMap::new();
@@ -717,10 +742,18 @@ impl StreamingProcessor {
 
             match gen_response.into_response() {
                 ProtoResponseVariant::Chunk(chunk) => {
-                    // Track TTFT immediately on first chunk received from backend
+                    // Track TTFT and ITL timing
+                    let now = Instant::now();
                     if first_token_time.is_none() {
-                        first_token_time = Some(Instant::now());
+                        first_token_time = Some(now);
+                    } else if let Some(last) = last_token_time {
+                        let num_tokens = chunk.token_ids().len() as u64;
+                        if num_tokens > 0 {
+                            let interval = now.duration_since(last).as_secs_f64();
+                            itl_observations.push((interval / num_tokens as f64, num_tokens));
+                        }
                     }
+                    last_token_time = Some(now);
 
                     let index = chunk.index();
 
@@ -804,7 +837,13 @@ impl StreamingProcessor {
 
         // Record streaming metrics
         let total_completion: u32 = completion_tokens_map.values().sum();
-        Self::record_generate_metrics(start_time, first_token_time, total_completion, &ctx);
+        Self::record_generate_metrics(
+            start_time,
+            first_token_time,
+            total_completion,
+            &ctx,
+            &itl_observations,
+        );
 
         Ok(())
     }
@@ -873,6 +912,8 @@ impl StreamingProcessor {
     ) -> Result<(), String> {
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
+        let mut last_token_time: Option<Instant> = None;
+        let mut itl_observations: Vec<(f64, u64)> = Vec::new();
 
         // Track state per index for n>1 case
         let mut accumulated_texts: HashMap<u32, String> = HashMap::new();
@@ -885,10 +926,18 @@ impl StreamingProcessor {
 
             match gen_response.into_response() {
                 ProtoResponseVariant::Chunk(chunk) => {
-                    // Track TTFT immediately on first chunk received from backend
+                    // Track TTFT and ITL timing
+                    let now = Instant::now();
                     if first_token_time.is_none() {
-                        first_token_time = Some(Instant::now());
+                        first_token_time = Some(now);
+                    } else if let Some(last) = last_token_time {
+                        let num_tokens = chunk.token_ids().len() as u64;
+                        if num_tokens > 0 {
+                            let interval = now.duration_since(last).as_secs_f64();
+                            itl_observations.push((interval / num_tokens as f64, num_tokens));
+                        }
                     }
+                    last_token_time = Some(now);
 
                     let index = chunk.index();
 
@@ -1012,7 +1061,13 @@ impl StreamingProcessor {
 
         // Record streaming metrics
         let total_completion: u32 = completion_tokens_map.values().sum();
-        Self::record_generate_metrics(start_time, first_token_time, total_completion, &ctx);
+        Self::record_generate_metrics(
+            start_time,
+            first_token_time,
+            total_completion,
+            &ctx,
+            &itl_observations,
+        );
 
         Ok(())
     }
@@ -1027,6 +1082,7 @@ impl StreamingProcessor {
         first_token_time: Option<Instant>,
         total_completion: u32,
         ctx: &GenerateStreamContext,
+        itl_observations: &[(f64, u64)],
     ) {
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
@@ -1037,6 +1093,11 @@ impl StreamingProcessor {
             generation_duration: start_time.elapsed(),
             input_tokens: None, // generate endpoint doesn't expose prompt tokens in streaming
             output_tokens: total_completion as u64,
+            itl_observations,
+            e2e_latency: ctx.pipeline_start.map(|ps| ps.elapsed()),
+            queue_time: ctx
+                .pipeline_start
+                .map(|ps| start_time.saturating_duration_since(ps)),
         });
     }
 
@@ -1412,6 +1473,7 @@ impl StreamingProcessor {
         messages_request: Arc<CreateMessageRequest>,
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
+        pipeline_start: Option<Instant>,
     ) -> Response {
         let stop_params = (
             messages_request
@@ -1443,6 +1505,7 @@ impl StreamingProcessor {
                             stop_params,
                             messages_request,
                             &tx,
+                            pipeline_start,
                         )
                         .await;
 
@@ -1476,6 +1539,7 @@ impl StreamingProcessor {
                             stop_params,
                             messages_request,
                             &tx,
+                            pipeline_start,
                         )
                         .await;
 
@@ -1510,6 +1574,7 @@ impl StreamingProcessor {
     ///
     /// Implements the Anthropic streaming protocol with content block
     /// state tracking. Always n=1 (no per-index HashMap).
+    #[expect(clippy::too_many_arguments)]
     pub async fn process_messages_streaming_chunks(
         &self,
         mut grpc_stream: ProtoStream,
@@ -1518,9 +1583,12 @@ impl StreamingProcessor {
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
         original_request: Arc<CreateMessageRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
+        pipeline_start: Option<Instant>,
     ) -> Result<(), String> {
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
+        let mut last_token_time: Option<Instant> = None;
+        let mut itl_observations: Vec<(f64, u64)> = Vec::new();
 
         // Reusable SSE formatting buffer to avoid allocations per event
         let mut sse_buffer = Vec::with_capacity(512);
@@ -1653,9 +1721,18 @@ impl StreamingProcessor {
 
             match gen_response.into_response() {
                 ProtoResponseVariant::Chunk(chunk) => {
+                    // Track TTFT and ITL timing
+                    let now = Instant::now();
                     if first_token_time.is_none() {
-                        first_token_time = Some(Instant::now());
+                        first_token_time = Some(now);
+                    } else if let Some(last) = last_token_time {
+                        let num_tokens = chunk.token_ids().len() as u64;
+                        if num_tokens > 0 {
+                            let interval = now.duration_since(last).as_secs_f64();
+                            itl_observations.push((interval / num_tokens as f64, num_tokens));
+                        }
                     }
+                    last_token_time = Some(now);
 
                     completion_tokens.record_chunk(&chunk);
 
@@ -2099,6 +2176,9 @@ impl StreamingProcessor {
             generation_duration: start_time.elapsed(),
             input_tokens: Some(u64::from(prompt_tokens)),
             output_tokens: u64::from(completion_tokens.total()),
+            itl_observations: &itl_observations,
+            e2e_latency: pipeline_start.map(|ps| ps.elapsed()),
+            queue_time: pipeline_start.map(|ps| start_time.saturating_duration_since(ps)),
         });
 
         Ok(())
@@ -2118,6 +2198,7 @@ impl StreamingProcessor {
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
         original_request: Arc<CreateMessageRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
+        pipeline_start: Option<Instant>,
     ) -> Result<(), String> {
         // Consume prefill stream (Messages API does not expose prompt logprobs)
         while let Some(response) = prefill_stream.next().await {
@@ -2140,6 +2221,7 @@ impl StreamingProcessor {
                 stop_params,
                 original_request,
                 tx,
+                pipeline_start,
             )
             .await;
 

@@ -99,6 +99,7 @@ impl ChatResponseProcessingStage {
                 ctx.chat_request_arc(), // Cheap Arc clone (8 bytes)
                 dispatch,
                 tokenizer,
+                ctx.state.pipeline_start,
             );
 
             // Attach load guards to response body for proper RAII lifecycle

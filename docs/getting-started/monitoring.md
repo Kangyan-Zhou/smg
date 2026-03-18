@@ -140,6 +140,9 @@ spec:
 | `smg_router_requests_total` | Counter | Requests by router_type, model, endpoint |
 | `smg_router_ttft_seconds` | Histogram | Time to first token (gRPC) |
 | `smg_router_tpot_seconds` | Histogram | Time per output token (gRPC) |
+| `smg_router_itl_seconds` | Histogram | Inter-token latency (gRPC) |
+| `smg_router_e2e_request_latency_seconds` | Histogram | End-to-end request latency (gRPC) |
+| `smg_router_queue_time_seconds` | Histogram | Pipeline/queue time before generation (gRPC) |
 | `smg_router_tokens_total` | Counter | Tokens by type (input/output) |
 | `smg_router_stage_duration_seconds` | Histogram | Pipeline stage durations |
 
@@ -187,6 +190,21 @@ sum(rate(smg_http_responses_total{status_code=~"5.."}[5m]))
 **Time to First Token (TTFT)**
 ```promql
 histogram_quantile(0.5, rate(smg_router_ttft_seconds_bucket[5m]))
+```
+
+**Inter-Token Latency (ITL)**
+```promql
+histogram_quantile(0.5, sum by (model, le) (rate(smg_router_itl_seconds_bucket[5m])))
+```
+
+**End-to-End Request Latency**
+```promql
+histogram_quantile(0.99, sum by (model, le) (rate(smg_router_e2e_request_latency_seconds_bucket[5m])))
+```
+
+**Queue Time**
+```promql
+histogram_quantile(0.5, sum by (model, le) (rate(smg_router_queue_time_seconds_bucket[5m])))
 ```
 
 **Tokens per Second**

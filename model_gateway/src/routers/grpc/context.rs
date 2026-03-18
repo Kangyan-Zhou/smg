@@ -107,6 +107,10 @@ pub(crate) struct ProcessingState {
 
     // Stage 6: Response processing state
     pub response: ResponseState,
+
+    /// Pipeline start time for E2E latency and queue time metrics.
+    /// Set at the beginning of pipeline execution.
+    pub pipeline_start: Option<std::time::Instant>,
 }
 
 /// Output from preparation stage (Step 1)

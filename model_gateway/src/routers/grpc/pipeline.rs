@@ -382,6 +382,7 @@ impl RequestPipeline {
         );
 
         let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
+        ctx.state.pipeline_start = Some(start);
 
         for stage in self.stages.iter() {
             match stage.execute(&mut ctx).await {
@@ -487,6 +488,7 @@ impl RequestPipeline {
         );
 
         let mut ctx = RequestContext::for_generate(request, headers, model_id.clone(), components);
+        ctx.state.pipeline_start = Some(start);
 
         for stage in self.stages.iter() {
             match stage.execute(&mut ctx).await {
@@ -594,6 +596,7 @@ impl RequestPipeline {
         );
 
         let mut ctx = RequestContext::for_embedding(request, headers, model_id.clone(), components);
+        ctx.state.pipeline_start = Some(start);
 
         for stage in self.stages.iter() {
             debug!("execute_embeddings: Executing stage: {}", stage.name());
@@ -694,6 +697,7 @@ impl RequestPipeline {
         );
 
         let mut ctx = RequestContext::for_classify(request, headers, model_id.clone(), components);
+        ctx.state.pipeline_start = Some(start);
 
         for stage in self.stages.iter() {
             debug!("execute_classify: Executing stage: {}", stage.name());
@@ -791,6 +795,7 @@ impl RequestPipeline {
         );
 
         let mut ctx = RequestContext::for_messages(request.clone(), headers, model_id, components);
+        ctx.state.pipeline_start = Some(start);
 
         for stage in self.stages.iter() {
             match stage.execute(&mut ctx).await {

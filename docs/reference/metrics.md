@@ -241,6 +241,57 @@ sum(rate(smg_router_tokens_total{type="output"}[5m])) / sum(rate(smg_router_toke
 
 ---
 
+### `smg_router_itl_seconds`
+
+Inter-token latency — per-token interval between consecutive stream chunks (gRPC streaming only).
+
+| Type | Labels |
+|------|--------|
+| Histogram | `model` |
+
+Buckets: `0.001, 0.002, 0.004, 0.006, 0.008, 0.010, 0.015, 0.020, 0.025, 0.030, 0.035, 0.040, 0.060, 0.080, 0.100, 0.200, 0.400, 0.600, 0.800, 1.000, 2.000, 4.000, 6.000, 8.000`
+
+```promql
+# P50 ITL
+histogram_quantile(0.5, sum by (model, le) (rate(smg_router_itl_seconds_bucket[5m])))
+```
+
+---
+
+### `smg_router_e2e_request_latency_seconds`
+
+End-to-end request latency from pipeline entry to stream completion (gRPC streaming only).
+
+| Type | Labels |
+|------|--------|
+| Histogram | `model` |
+
+Buckets: `0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 20.0, 40.0, 60.0, 80.0, 100.0, 200.0, 400.0, 600.0, 1200.0, 1800.0, 2400.0`
+
+```promql
+# P99 E2E request latency
+histogram_quantile(0.99, sum by (model, le) (rate(smg_router_e2e_request_latency_seconds_bucket[5m])))
+```
+
+---
+
+### `smg_router_queue_time_seconds`
+
+Time from pipeline entry to stream start — pipeline/queuing overhead before generation begins (gRPC streaming only).
+
+| Type | Labels |
+|------|--------|
+| Histogram | `model` |
+
+Buckets: `0.001, 0.005, 0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0, 600.0`
+
+```promql
+# P50 queue time
+histogram_quantile(0.5, sum by (model, le) (rate(smg_router_queue_time_seconds_bucket[5m])))
+```
+
+---
+
 ### `smg_router_generation_duration_seconds`
 
 Total generation time (first token to last token).
@@ -596,6 +647,9 @@ Entries in the cache-aware routing cache.
 | Error rate | `sum(rate(smg_http_responses_total{status_code=~"5.."}[5m])) / sum(rate(smg_http_responses_total[5m]))` |
 | P99 latency | `histogram_quantile(0.99, rate(smg_http_request_duration_seconds_bucket[5m]))` |
 | TTFT P50 | `histogram_quantile(0.5, rate(smg_router_ttft_seconds_bucket[5m]))` |
+| ITL P50 | `histogram_quantile(0.5, rate(smg_router_itl_seconds_bucket[5m]))` |
+| E2E latency P99 | `histogram_quantile(0.99, rate(smg_router_e2e_request_latency_seconds_bucket[5m]))` |
+| Queue time P50 | `histogram_quantile(0.5, rate(smg_router_queue_time_seconds_bucket[5m]))` |
 | Tokens/sec | `sum(rate(smg_router_tokens_total[5m]))` |
 | Healthy workers | `sum(smg_worker_health)` |
 | Open circuits | `count(smg_worker_cb_state == 1)` |
@@ -606,11 +660,40 @@ Entries in the cache-aware routing cache.
 
 ## Histogram Buckets
 
-Default histogram buckets (20 buckets from 1ms to 240s):
+**Default duration buckets** (applies to `*_duration_seconds` metrics):
 
 ```
-0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1,
-2.5, 5, 10, 15, 30, 60, 120, 180, 240
+0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
+5.0, 10.0, 15.0, 30.0, 45.0, 60.0, 90.0, 120.0, 180.0, 240.0
+```
+
+**TTFT buckets** (`smg_router_ttft_seconds`):
+
+```
+0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0,
+2.0, 4.0, 6.0, 8.0, 10.0, 20.0, 40.0, 60.0, 80.0, 100.0, 200.0, 400.0
+```
+
+**ITL/TPOT buckets** (`smg_router_itl_seconds`, `smg_router_tpot_seconds`):
+
+```
+0.001, 0.002, 0.004, 0.006, 0.008, 0.010, 0.015, 0.020, 0.025, 0.030,
+0.035, 0.040, 0.060, 0.080, 0.100, 0.200, 0.400, 0.600, 0.800, 1.000,
+2.000, 4.000, 6.000, 8.000
+```
+
+**E2E latency buckets** (`smg_router_e2e_request_latency_seconds`):
+
+```
+0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 20.0,
+40.0, 60.0, 80.0, 100.0, 200.0, 400.0, 600.0, 1200.0, 1800.0, 2400.0
+```
+
+**Queue time buckets** (`smg_router_queue_time_seconds`):
+
+```
+0.001, 0.005, 0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0,
+5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0, 600.0
 ```
 
 Configure custom buckets via CLI:

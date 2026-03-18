@@ -90,6 +90,7 @@ impl PipelineStage for MessageResponseProcessingStage {
                     ctx.messages_request_arc(),
                     dispatch,
                     tokenizer,
+                    ctx.state.pipeline_start,
                 );
 
             // Attach load guards for RAII lifecycle

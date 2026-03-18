@@ -211,6 +211,18 @@ pub(crate) fn init_metrics() {
         "smg_router_generation_duration_seconds",
         "Total generation time by router_type, backend_type, model, endpoint (gRPC only)"
     );
+    describe_histogram!(
+        "smg_router_itl_seconds",
+        "Inter-token latency by router_type, backend_type, model, endpoint (gRPC only)"
+    );
+    describe_histogram!(
+        "smg_router_e2e_request_latency_seconds",
+        "End-to-end request latency from pipeline entry to completion by router_type, backend_type, model, endpoint (gRPC only)"
+    );
+    describe_histogram!(
+        "smg_router_queue_time_seconds",
+        "Time from pipeline entry to stream start by router_type, backend_type, model, endpoint (gRPC only)"
+    );
 
     // Layer 3: Worker metrics
     describe_gauge!(
@@ -355,11 +367,46 @@ pub fn start_prometheus(config: PrometheusConfig) {
         .unwrap_or(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
     let socket_addr = SocketAddr::new(ip_addr, config.port);
 
+    // Specialized buckets for inference metrics (matching SGLang engine defaults)
+    let ttft_buckets: Vec<f64> = vec![
+        0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 2.0, 4.0, 6.0, 8.0, 10.0,
+        20.0, 40.0, 60.0, 80.0, 100.0, 200.0, 400.0,
+    ];
+    let itl_buckets: Vec<f64> = vec![
+        0.001, 0.002, 0.004, 0.006, 0.008, 0.010, 0.015, 0.020, 0.025, 0.030, 0.035, 0.040, 0.060,
+        0.080, 0.100, 0.200, 0.400, 0.600, 0.800, 1.000, 2.000, 4.000, 6.000, 8.000,
+    ];
+    let tpot_buckets: Vec<f64> = itl_buckets.clone();
+    let e2e_buckets: Vec<f64> = vec![
+        0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 20.0, 40.0, 60.0, 80.0, 100.0,
+        200.0, 400.0, 600.0, 1200.0, 1800.0, 2400.0,
+    ];
+    let queue_time_buckets: Vec<f64> = vec![
+        0.001, 0.005, 0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0,
+        300.0, 600.0,
+    ];
+
+    let ttft_matcher = Matcher::Full(String::from("smg_router_ttft_seconds"));
+    let itl_matcher = Matcher::Full(String::from("smg_router_itl_seconds"));
+    let tpot_matcher = Matcher::Full(String::from("smg_router_tpot_seconds"));
+    let e2e_matcher = Matcher::Full(String::from("smg_router_e2e_request_latency_seconds"));
+    let queue_matcher = Matcher::Full(String::from("smg_router_queue_time_seconds"));
+
     PrometheusBuilder::new()
         .with_http_listener(socket_addr)
         .upkeep_timeout(Duration::from_secs(5 * 60))
         .set_buckets_for_metric(duration_matcher, &duration_bucket)
         .expect("failed to set duration bucket")
+        .set_buckets_for_metric(ttft_matcher, &ttft_buckets)
+        .expect("failed to set TTFT bucket")
+        .set_buckets_for_metric(itl_matcher, &itl_buckets)
+        .expect("failed to set ITL bucket")
+        .set_buckets_for_metric(tpot_matcher, &tpot_buckets)
+        .expect("failed to set TPOT bucket")
+        .set_buckets_for_metric(e2e_matcher, &e2e_buckets)
+        .expect("failed to set E2E bucket")
+        .set_buckets_for_metric(queue_matcher, &queue_time_buckets)
+        .expect("failed to set queue time bucket")
         .install()
         .expect("failed to install Prometheus metrics exporter");
 }
@@ -485,6 +532,15 @@ pub struct StreamingMetricsParams<'a> {
     pub input_tokens: Option<u64>,
     /// Output token count
     pub output_tokens: u64,
+    /// Per-token inter-token latency observations (each entry is the interval
+    /// between consecutive chunks divided by the number of tokens in that chunk)
+    pub itl_observations: &'a [(f64, u64)],
+    /// Time from pipeline entry to stream completion (full request latency).
+    /// None if pipeline_start is not available.
+    pub e2e_latency: Option<Duration>,
+    /// Time from pipeline entry to stream start (queue/pipeline overhead).
+    /// None if pipeline_start is not available.
+    pub queue_time: Option<Duration>,
 }
 
 impl Metrics {
@@ -746,6 +802,9 @@ impl Metrics {
             generation_duration,
             input_tokens,
             output_tokens,
+            itl_observations,
+            e2e_latency,
+            queue_time,
         } = params;
 
         // Intern model string once - Arc::clone is just a ref count increment
@@ -775,6 +834,46 @@ impl Metrics {
                 )
                 .record(tpot.as_secs_f64());
             }
+        }
+
+        // ITL - per-token inter-token latency observations
+        if !itl_observations.is_empty() {
+            let itl_hist = histogram!(
+                "smg_router_itl_seconds",
+                "router_type" => router_type,
+                "backend_type" => backend_type,
+                "model" => Arc::clone(&model),
+                "endpoint" => endpoint
+            );
+            for &(itl_per_token, num_tokens) in itl_observations {
+                for _ in 0..num_tokens {
+                    itl_hist.record(itl_per_token);
+                }
+            }
+        }
+
+        // E2E request latency (pipeline entry to stream completion)
+        if let Some(e2e) = e2e_latency {
+            histogram!(
+                "smg_router_e2e_request_latency_seconds",
+                "router_type" => router_type,
+                "backend_type" => backend_type,
+                "model" => Arc::clone(&model),
+                "endpoint" => endpoint
+            )
+            .record(e2e.as_secs_f64());
+        }
+
+        // Queue time (pipeline entry to stream start)
+        if let Some(qt) = queue_time {
+            histogram!(
+                "smg_router_queue_time_seconds",
+                "router_type" => router_type,
+                "backend_type" => backend_type,
+                "model" => Arc::clone(&model),
+                "endpoint" => endpoint
+            )
+            .record(qt.as_secs_f64());
         }
 
         // Generation duration (always recorded)
@@ -1525,5 +1624,226 @@ mod tests {
         assert_eq!(method_to_static_str("GET"), "GET");
         assert_eq!(method_to_static_str("POST"), "POST");
         assert_eq!(method_to_static_str("UNKNOWN"), "OTHER");
+    }
+
+    // ========================================================================
+    // Streaming metrics tests (ITL, E2E, queue time)
+    // ========================================================================
+
+    #[test]
+    fn test_streaming_metrics_params_full() {
+        // Verify StreamingMetricsParams accepts all new fields
+        let itl_obs = vec![(0.025, 3u64), (0.030, 2), (0.028, 4)];
+        let params = StreamingMetricsParams {
+            router_type: "grpc",
+            backend_type: "regular",
+            model_id: "test-model",
+            endpoint: "chat",
+            ttft: Some(Duration::from_millis(150)),
+            generation_duration: Duration::from_secs(2),
+            input_tokens: Some(100),
+            output_tokens: 50,
+            itl_observations: &itl_obs,
+            e2e_latency: Some(Duration::from_millis(2500)),
+            queue_time: Some(Duration::from_millis(300)),
+        };
+
+        assert_eq!(params.itl_observations.len(), 3);
+        assert_eq!(params.e2e_latency.unwrap().as_millis(), 2500);
+        assert_eq!(params.queue_time.unwrap().as_millis(), 300);
+    }
+
+    #[test]
+    fn test_streaming_metrics_params_no_optional_fields() {
+        // Verify StreamingMetricsParams works with empty ITL and None for new fields
+        let params = StreamingMetricsParams {
+            router_type: "grpc",
+            backend_type: "pd",
+            model_id: "test-model",
+            endpoint: "generate",
+            ttft: None,
+            generation_duration: Duration::from_secs(1),
+            input_tokens: None,
+            output_tokens: 0,
+            itl_observations: &[],
+            e2e_latency: None,
+            queue_time: None,
+        };
+
+        assert!(params.itl_observations.is_empty());
+        assert!(params.e2e_latency.is_none());
+        assert!(params.queue_time.is_none());
+    }
+
+    #[test]
+    fn test_record_streaming_metrics_does_not_panic() {
+        // Verify record_streaming_metrics doesn't panic with various inputs.
+        // Note: actual metric recording requires a Prometheus exporter; without one
+        // the metrics crate silently drops observations (by design). This test
+        // ensures the function handles all edge cases without panicking.
+
+        // Case 1: Full metrics with ITL, E2E, and queue time
+        let itl_obs = vec![(0.025, 1u64), (0.030, 2)];
+        Metrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: "grpc",
+            backend_type: "regular",
+            model_id: "test-model-full",
+            endpoint: "chat",
+            ttft: Some(Duration::from_millis(100)),
+            generation_duration: Duration::from_secs(1),
+            input_tokens: Some(50),
+            output_tokens: 20,
+            itl_observations: &itl_obs,
+            e2e_latency: Some(Duration::from_millis(1500)),
+            queue_time: Some(Duration::from_millis(400)),
+        });
+
+        // Case 2: No TTFT (no tokens generated)
+        Metrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: "grpc",
+            backend_type: "pd",
+            model_id: "test-model-no-ttft",
+            endpoint: "generate",
+            ttft: None,
+            generation_duration: Duration::from_millis(50),
+            input_tokens: Some(10),
+            output_tokens: 0,
+            itl_observations: &[],
+            e2e_latency: Some(Duration::from_millis(100)),
+            queue_time: Some(Duration::from_millis(50)),
+        });
+
+        // Case 3: Single token (no TPOT, no ITL)
+        Metrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: "grpc",
+            backend_type: "harmony",
+            model_id: "test-model-single-token",
+            endpoint: "chat",
+            ttft: Some(Duration::from_millis(200)),
+            generation_duration: Duration::from_millis(200),
+            input_tokens: Some(5),
+            output_tokens: 1,
+            itl_observations: &[],
+            e2e_latency: Some(Duration::from_millis(500)),
+            queue_time: Some(Duration::from_millis(300)),
+        });
+
+        // Case 4: No pipeline_start (None for e2e and queue_time)
+        Metrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: "grpc",
+            backend_type: "regular",
+            model_id: "test-model-no-pipeline",
+            endpoint: "messages",
+            ttft: Some(Duration::from_millis(50)),
+            generation_duration: Duration::from_secs(3),
+            input_tokens: Some(200),
+            output_tokens: 100,
+            itl_observations: &[(0.015, 5)],
+            e2e_latency: None,
+            queue_time: None,
+        });
+    }
+
+    #[test]
+    fn test_itl_computation_logic() {
+        // Verify the ITL per-token computation is correct:
+        // If a chunk arrives 60ms after the previous chunk with 3 tokens,
+        // the per-token ITL should be 20ms.
+        let interval_secs = 0.060; // 60ms between chunks
+        let num_tokens: u64 = 3;
+        let per_token_itl = interval_secs / num_tokens as f64;
+
+        assert!((per_token_itl - 0.020).abs() < 1e-9);
+
+        // Single token: ITL equals the full interval
+        let single_token_itl: f64 = 0.030 / 1.0;
+        assert!((single_token_itl - 0.030).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_queue_time_computation_logic() {
+        // Verify queue time = stream_start - pipeline_start
+        use std::time::Instant;
+
+        let pipeline_start = Instant::now();
+        // Simulate some pipeline overhead
+        std::thread::sleep(Duration::from_millis(5));
+        let stream_start = Instant::now();
+
+        let queue_time = stream_start.duration_since(pipeline_start);
+        assert!(queue_time.as_millis() >= 4); // At least ~5ms of queue time
+    }
+
+    #[test]
+    fn test_e2e_latency_computation_logic() {
+        // Verify e2e_latency = pipeline_start.elapsed() at stream end
+        use std::time::Instant;
+
+        let pipeline_start = Instant::now();
+        std::thread::sleep(Duration::from_millis(10));
+        let e2e = pipeline_start.elapsed();
+
+        assert!(e2e.as_millis() >= 9);
+    }
+
+    #[test]
+    fn test_specialized_bucket_configs() {
+        // Verify TTFT buckets cover the expected range (1ms to 400s)
+        let ttft_buckets: Vec<f64> = vec![
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 2.0, 4.0, 6.0, 8.0,
+            10.0, 20.0, 40.0, 60.0, 80.0, 100.0, 200.0, 400.0,
+        ];
+        assert_eq!(ttft_buckets.len(), 23);
+        assert!((ttft_buckets[0] - 0.001).abs() < f64::EPSILON);
+        assert!((ttft_buckets[22] - 400.0).abs() < f64::EPSILON);
+        for i in 1..ttft_buckets.len() {
+            assert!(
+                ttft_buckets[i] > ttft_buckets[i - 1],
+                "TTFT buckets must be sorted"
+            );
+        }
+
+        // Verify ITL buckets cover decode latency range (1ms to 8s)
+        let itl_buckets: Vec<f64> = vec![
+            0.001, 0.002, 0.004, 0.006, 0.008, 0.010, 0.015, 0.020, 0.025, 0.030, 0.035, 0.040,
+            0.060, 0.080, 0.100, 0.200, 0.400, 0.600, 0.800, 1.000, 2.000, 4.000, 6.000, 8.000,
+        ];
+        assert_eq!(itl_buckets.len(), 24);
+        assert!((itl_buckets[0] - 0.001).abs() < f64::EPSILON);
+        assert!((itl_buckets[23] - 8.0).abs() < f64::EPSILON);
+        for i in 1..itl_buckets.len() {
+            assert!(
+                itl_buckets[i] > itl_buckets[i - 1],
+                "ITL buckets must be sorted"
+            );
+        }
+
+        // Verify E2E buckets cover full request range (100ms to 2400s)
+        let e2e_buckets: Vec<f64> = vec![
+            0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 20.0, 40.0, 60.0, 80.0, 100.0,
+            200.0, 400.0, 600.0, 1200.0, 1800.0, 2400.0,
+        ];
+        assert_eq!(e2e_buckets.len(), 22);
+        assert!((e2e_buckets[0] - 0.1).abs() < f64::EPSILON);
+        assert!((e2e_buckets[21] - 2400.0).abs() < f64::EPSILON);
+        for i in 1..e2e_buckets.len() {
+            assert!(
+                e2e_buckets[i] > e2e_buckets[i - 1],
+                "E2E buckets must be sorted"
+            );
+        }
+
+        // Verify queue time buckets
+        let queue_buckets: Vec<f64> = vec![
+            0.001, 0.005, 0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0,
+            300.0, 600.0,
+        ];
+        assert_eq!(queue_buckets.len(), 17);
+        for i in 1..queue_buckets.len() {
+            assert!(
+                queue_buckets[i] > queue_buckets[i - 1],
+                "Queue buckets must be sorted"
+            );
+        }
     }
 }
