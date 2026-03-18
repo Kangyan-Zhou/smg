@@ -3,7 +3,7 @@
 //! - For streaming: Spawns background task and returns SSE response (early exit)
 //! - For non-streaming: Collects all responses and builds final ChatCompletionResponse
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use axum::response::Response;
@@ -11,6 +11,7 @@ use tracing::error;
 
 use crate::{
     core::AttachedBody,
+    observability::metrics::{metrics_labels, Metrics, RequestMetricsParams},
     routers::{
         error,
         grpc::{
@@ -112,6 +113,7 @@ impl ChatResponseProcessingStage {
         }
 
         // Non-streaming: Delegate to ResponseProcessor
+        let start_time = Instant::now();
         let request_logprobs = ctx.chat_request().logprobs;
 
         let chat_request = ctx.chat_request_arc();
@@ -132,12 +134,41 @@ impl ChatResponseProcessingStage {
             .process_non_streaming_chat_response(
                 execution_result,
                 chat_request,
-                dispatch,
+                dispatch.clone(),
                 tokenizer,
                 stop_decoder,
                 request_logprobs,
             )
             .await?;
+
+        // Record non-streaming request metrics
+        let (input_tokens, output_tokens) = response
+            .usage
+            .as_ref()
+            .map(|u| {
+                (
+                    Some(u64::from(u.prompt_tokens)),
+                    u64::from(u.completion_tokens),
+                )
+            })
+            .unwrap_or((None, 0));
+
+        Metrics::record_request_metrics(RequestMetricsParams {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type: self.streaming_processor.backend_type(),
+            model_id: &dispatch.model,
+            endpoint: metrics_labels::ENDPOINT_CHAT,
+            ttft: None,
+            generation_duration: start_time.elapsed(),
+            input_tokens,
+            output_tokens,
+            itl_observations: &[],
+            e2e_latency: ctx.state.pipeline_start.map(|ps| ps.elapsed()),
+            queue_time: ctx
+                .state
+                .pipeline_start
+                .map(|ps| start_time.saturating_duration_since(ps)),
+        });
 
         // Store the final response
         ctx.state.response.final_response = Some(FinalResponse::Chat(response));

@@ -8,6 +8,7 @@ use tracing::error;
 
 use crate::{
     core::AttachedBody,
+    observability::metrics::{metrics_labels, Metrics, RequestMetricsParams},
     routers::{
         error,
         grpc::{
@@ -131,12 +132,39 @@ impl GenerateResponseProcessingStage {
             .process_non_streaming_generate_response(
                 execution_result,
                 generate_request,
-                dispatch,
+                dispatch.clone(),
                 stop_decoder,
                 request_logprobs,
                 start_time,
             )
             .await?;
+
+        // Record non-streaming request metrics
+        let output_tokens: u64 = result_array
+            .iter()
+            .map(|r| u64::from(r.meta_info.completion_tokens))
+            .sum();
+        let input_tokens: u64 = result_array
+            .iter()
+            .map(|r| u64::from(r.meta_info.prompt_tokens))
+            .sum();
+
+        Metrics::record_request_metrics(RequestMetricsParams {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type: self.streaming_processor.backend_type(),
+            model_id: &dispatch.model,
+            endpoint: metrics_labels::ENDPOINT_GENERATE,
+            ttft: None,
+            generation_duration: start_time.elapsed(),
+            input_tokens: Some(input_tokens),
+            output_tokens,
+            itl_observations: &[],
+            e2e_latency: ctx.state.pipeline_start.map(|ps| ps.elapsed()),
+            queue_time: ctx
+                .state
+                .pipeline_start
+                .map(|ps| start_time.saturating_duration_since(ps)),
+        });
 
         // Store the final response
         ctx.state.response.final_response = Some(FinalResponse::Generate(result_array));

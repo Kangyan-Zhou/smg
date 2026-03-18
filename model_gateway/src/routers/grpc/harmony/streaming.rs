@@ -29,7 +29,7 @@ use super::{
     types::HarmonyChannelDelta, HarmonyParserAdapter,
 };
 use crate::{
-    observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
+    observability::metrics::{metrics_labels, Metrics, RequestMetricsParams},
     routers::grpc::{
         common::{
             response_formatting::CompletionTokenTracker,
@@ -353,7 +353,7 @@ impl HarmonyStreamingProcessor {
         }
 
         // Record streaming metrics
-        Metrics::record_streaming_metrics(StreamingMetricsParams {
+        Metrics::record_request_metrics(RequestMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: metrics_labels::BACKEND_HARMONY,
             model_id: &original_request.model,

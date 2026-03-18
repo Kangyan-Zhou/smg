@@ -1,6 +1,6 @@
 //! Harmony Response Processing Stage: Parse Harmony channels to ChatCompletionResponse
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use axum::response::Response;
@@ -9,6 +9,7 @@ use tracing::error;
 use super::super::{HarmonyResponseProcessor, HarmonyStreamingProcessor};
 use crate::{
     core::AttachedBody,
+    observability::metrics::{metrics_labels, Metrics, RequestMetricsParams},
     routers::{
         error,
         grpc::{
@@ -93,11 +94,45 @@ impl PipelineStage for HarmonyResponseProcessingStage {
                 }
 
                 // For non-streaming, delegate to Harmony response processor to build ChatCompletionResponse
+                let start_time = Instant::now();
                 let chat_request = ctx.chat_request_arc();
                 let response = self
                     .processor
-                    .process_non_streaming_chat_response(execution_result, chat_request, dispatch)
+                    .process_non_streaming_chat_response(
+                        execution_result,
+                        chat_request,
+                        dispatch.clone(),
+                    )
                     .await?;
+
+                // Record non-streaming request metrics
+                let (input_tokens, output_tokens) = response
+                    .usage
+                    .as_ref()
+                    .map(|u| {
+                        (
+                            Some(u64::from(u.prompt_tokens)),
+                            u64::from(u.completion_tokens),
+                        )
+                    })
+                    .unwrap_or((None, 0));
+
+                Metrics::record_request_metrics(RequestMetricsParams {
+                    router_type: metrics_labels::ROUTER_GRPC,
+                    backend_type: metrics_labels::BACKEND_HARMONY,
+                    model_id: &dispatch.model,
+                    endpoint: metrics_labels::ENDPOINT_CHAT,
+                    ttft: None,
+                    generation_duration: start_time.elapsed(),
+                    input_tokens,
+                    output_tokens,
+                    itl_observations: &[],
+                    e2e_latency: ctx.state.pipeline_start.map(|ps| ps.elapsed()),
+                    queue_time: ctx
+                        .state
+                        .pipeline_start
+                        .map(|ps| start_time.saturating_duration_since(ps)),
+                });
 
                 ctx.state.response.final_response = Some(FinalResponse::Chat(response));
                 Ok(None)

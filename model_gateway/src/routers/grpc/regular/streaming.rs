@@ -28,7 +28,7 @@ use tool_parser::{ParserFactory as ToolParserFactory, StreamingParseResult, Tool
 use tracing::{debug, error, warn};
 
 use crate::{
-    observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
+    observability::metrics::{metrics_labels, Metrics, RequestMetricsParams},
     routers::grpc::{
         common::{response_formatting::CompletionTokenTracker, responses::build_sse_response},
         context,
@@ -73,6 +73,11 @@ impl StreamingProcessor {
             configured_reasoning_parser,
             backend_type,
         }
+    }
+
+    /// Returns the backend type label (e.g., "regular", "pd")
+    pub fn backend_type(&self) -> &'static str {
+        self.backend_type
     }
 
     /// Process streaming chat response and return SSE response
@@ -565,7 +570,7 @@ impl StreamingProcessor {
         // Record streaming metrics
         let total_prompt: u32 = prompt_tokens.values().sum();
         let total_completion: u32 = completion_tokens.total();
-        Metrics::record_streaming_metrics(StreamingMetricsParams {
+        Metrics::record_request_metrics(RequestMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: self.backend_type,
             model_id: model,
@@ -1084,7 +1089,7 @@ impl StreamingProcessor {
         ctx: &GenerateStreamContext,
         itl_observations: &[(f64, u64)],
     ) {
-        Metrics::record_streaming_metrics(StreamingMetricsParams {
+        Metrics::record_request_metrics(RequestMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: ctx.backend_type,
             model_id: &ctx.model,
@@ -2167,7 +2172,7 @@ impl StreamingProcessor {
         grpc_stream.mark_completed();
 
         // Record metrics
-        Metrics::record_streaming_metrics(StreamingMetricsParams {
+        Metrics::record_request_metrics(RequestMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: self.backend_type,
             model_id: model,

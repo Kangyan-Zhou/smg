@@ -514,8 +514,8 @@ pub mod metrics_labels {
 /// - Static labels use the metrics crate's internal caching
 pub struct Metrics;
 
-/// Parameters for recording streaming metrics.
-pub struct StreamingMetricsParams<'a> {
+/// Parameters for recording request metrics (streaming and non-streaming).
+pub struct RequestMetricsParams<'a> {
     /// Router type label (e.g., "grpc", "http")
     pub router_type: &'static str,
     /// Backend type label (e.g., "regular", "pd")
@@ -788,12 +788,13 @@ impl Metrics {
         .record(duration.as_secs_f64());
     }
 
-    /// Record all streaming metrics in a single batch call.
+    /// Record all request metrics in a single batch call.
     ///
     /// This consolidates TTFT, TPOT, generation duration, and token metrics
     /// into one function, handling TPOT calculation internally.
-    pub fn record_streaming_metrics(params: StreamingMetricsParams<'_>) {
-        let StreamingMetricsParams {
+    /// Works for both streaming and non-streaming requests.
+    pub fn record_request_metrics(params: RequestMetricsParams<'_>) {
+        let RequestMetricsParams {
             router_type,
             backend_type,
             model_id,
@@ -1627,14 +1628,14 @@ mod tests {
     }
 
     // ========================================================================
-    // Streaming metrics tests (ITL, E2E, queue time)
+    // Request metrics tests (ITL, E2E, queue time)
     // ========================================================================
 
     #[test]
-    fn test_streaming_metrics_params_full() {
-        // Verify StreamingMetricsParams accepts all new fields
+    fn test_request_metrics_params_full() {
+        // Verify RequestMetricsParams accepts all new fields
         let itl_obs = vec![(0.025, 3u64), (0.030, 2), (0.028, 4)];
-        let params = StreamingMetricsParams {
+        let params = RequestMetricsParams {
             router_type: "grpc",
             backend_type: "regular",
             model_id: "test-model",
@@ -1654,9 +1655,9 @@ mod tests {
     }
 
     #[test]
-    fn test_streaming_metrics_params_no_optional_fields() {
-        // Verify StreamingMetricsParams works with empty ITL and None for new fields
-        let params = StreamingMetricsParams {
+    fn test_request_metrics_params_no_optional_fields() {
+        // Verify RequestMetricsParams works with empty ITL and None for new fields
+        let params = RequestMetricsParams {
             router_type: "grpc",
             backend_type: "pd",
             model_id: "test-model",
@@ -1676,15 +1677,15 @@ mod tests {
     }
 
     #[test]
-    fn test_record_streaming_metrics_does_not_panic() {
-        // Verify record_streaming_metrics doesn't panic with various inputs.
+    fn test_record_request_metrics_does_not_panic() {
+        // Verify record_request_metrics doesn't panic with various inputs.
         // Note: actual metric recording requires a Prometheus exporter; without one
         // the metrics crate silently drops observations (by design). This test
         // ensures the function handles all edge cases without panicking.
 
         // Case 1: Full metrics with ITL, E2E, and queue time
         let itl_obs = vec![(0.025, 1u64), (0.030, 2)];
-        Metrics::record_streaming_metrics(StreamingMetricsParams {
+        Metrics::record_request_metrics(RequestMetricsParams {
             router_type: "grpc",
             backend_type: "regular",
             model_id: "test-model-full",
@@ -1699,7 +1700,7 @@ mod tests {
         });
 
         // Case 2: No TTFT (no tokens generated)
-        Metrics::record_streaming_metrics(StreamingMetricsParams {
+        Metrics::record_request_metrics(RequestMetricsParams {
             router_type: "grpc",
             backend_type: "pd",
             model_id: "test-model-no-ttft",
@@ -1714,7 +1715,7 @@ mod tests {
         });
 
         // Case 3: Single token (no TPOT, no ITL)
-        Metrics::record_streaming_metrics(StreamingMetricsParams {
+        Metrics::record_request_metrics(RequestMetricsParams {
             router_type: "grpc",
             backend_type: "harmony",
             model_id: "test-model-single-token",
@@ -1729,7 +1730,7 @@ mod tests {
         });
 
         // Case 4: No pipeline_start (None for e2e and queue_time)
-        Metrics::record_streaming_metrics(StreamingMetricsParams {
+        Metrics::record_request_metrics(RequestMetricsParams {
             router_type: "grpc",
             backend_type: "regular",
             model_id: "test-model-no-pipeline",
