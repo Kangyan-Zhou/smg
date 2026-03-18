@@ -40,13 +40,18 @@ pub(crate) async fn collect_responses(
             mut prefill,
             decode,
         } => {
-            // Collect prefill for input_logprobs (don't mark completed yet)
-            let prefill_responses = collect_stream_responses(&mut prefill, "Prefill").await?;
-
-            // Collect decode for actual output (don't mark completed yet)
             let mut decode_stream = *decode;
-            let mut decode_responses =
-                collect_stream_responses(&mut decode_stream, "Decode").await?;
+
+            // Collect both streams concurrently.  If either side fails (e.g.
+            // decode returns 503 / UNAVAILABLE), the other future is cancelled
+            // immediately.  Because `mark_completed()` is never called on the
+            // cancelled stream, its `Drop` impl fires an abort RPC to the
+            // backend, which unblocks the engine's bootstrap wait instead of
+            // letting it time out for 60 s.
+            let (prefill_responses, mut decode_responses) = tokio::try_join!(
+                collect_stream_responses(&mut prefill, "Prefill"),
+                collect_stream_responses(&mut decode_stream, "Decode"),
+            )?;
 
             // Mark both streams as completed now that both succeeded
             prefill.mark_completed();
