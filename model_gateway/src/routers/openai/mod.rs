@@ -8,6 +8,7 @@
 //! - SSE (Server-Sent Events) streaming
 
 mod chat;
+mod completions;
 mod context;
 mod health;
 pub(crate) mod mcp;
