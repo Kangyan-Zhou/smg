@@ -654,12 +654,6 @@ async fn test_unsupported_endpoints() {
 
     let response = router.route_generate(None, &generate_request, None).await;
     assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-
-    let completion_request = create_minimal_completion_request();
-    let response = router
-        .route_completion(None, &completion_request, None)
-        .await;
-    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
 }
 
 /// Test chat completion with mock OpenAI server
@@ -696,6 +690,35 @@ async fn test_openai_router_chat_completion_with_mock() {
     assert_eq!(chat_response["object"], "chat.completion");
     assert_eq!(chat_response["model"], "gpt-3.5-turbo");
     assert!(!chat_response["choices"].as_array().unwrap().is_empty());
+}
+
+/// Test completion with mock OpenAI server
+#[tokio::test]
+async fn test_openai_router_completion_with_mock() {
+    let mock_server = MockOpenAIServer::new().await;
+    let base_url = mock_server.base_url();
+
+    let ctx = create_test_app_context().await;
+    register_external_worker(&ctx, &base_url, None);
+    let router = OpenAIRouter::new(&ctx).await.unwrap();
+
+    let completion_request = create_minimal_completion_request();
+    let response = router
+        .route_completion(None, &completion_request, None)
+        .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let (_, body) = response.into_parts();
+    let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+    let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
+    let completion_response: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+
+    assert_eq!(completion_response["object"], "text_completion");
+    assert_eq!(completion_response["model"], "gpt-3.5-turbo");
+    let choices = completion_response["choices"].as_array().unwrap();
+    assert!(!choices.is_empty());
+    assert!(choices[0]["text"].as_str().is_some());
 }
 
 /// Test full E2E flow with Axum server

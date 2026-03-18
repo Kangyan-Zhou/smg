@@ -6,6 +6,7 @@ use std::{
 use axum::{body::Body, extract::Request, http::HeaderMap, response::Response};
 use openai_protocol::{
     chat::ChatCompletionRequest,
+    completion::CompletionRequest,
     realtime_session::{
         RealtimeClientSecretCreateRequest, RealtimeSessionCreateRequest,
         RealtimeTranscriptionSessionCreateRequest,
@@ -15,6 +16,7 @@ use openai_protocol::{
 
 use super::{
     chat::{self, ChatRouterContext},
+    completions::{self, CompletionRouterContext},
     context::{ResponsesComponents, SharedComponents},
     health,
     provider::ProviderRegistry,
@@ -152,6 +154,22 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             retry_config: &self.retry_config,
         };
         chat::route_chat(&deps, headers, body, model_id).await
+    }
+
+    async fn route_completion(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &CompletionRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let deps = CompletionRouterContext {
+            worker_registry: &self.worker_registry,
+            provider_registry: &self.provider_registry,
+            shared_components: &self.shared_components,
+            client: &self.shared_components.client,
+            retry_config: &self.retry_config,
+        };
+        completions::route_completion(&deps, headers, body, model_id).await
     }
 
     async fn route_responses(
