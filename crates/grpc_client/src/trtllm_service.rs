@@ -11,6 +11,7 @@ use std::{
 use openai_protocol::{
     chat::ChatCompletionRequest,
     common::{ResponseFormat, StringOrArray},
+    completion::CompletionRequest,
     generate::GenerateRequest,
     messages::CreateMessageRequest,
     responses::ResponsesRequest,
@@ -397,6 +398,111 @@ impl TrtllmServiceClient {
         };
 
         Ok(grpc_request)
+    }
+
+    /// Build a GenerateRequest from OpenAI CompletionRequest (/v1/completions)
+    #[expect(
+        clippy::unused_self,
+        reason = "method receiver kept for consistent public API"
+    )]
+    pub fn build_generate_request_from_completion(
+        &self,
+        request_id: String,
+        body: &CompletionRequest,
+        original_text: String,
+        token_ids: Vec<u32>,
+    ) -> proto::GenerateRequest {
+        let sampling_config = Self::build_sampling_config_from_completion(body);
+        let output_config = proto::OutputConfig {
+            logprobs: body.logprobs.map(|v| v as i32),
+            prompt_logprobs: None,
+            return_context_logits: false,
+            return_generation_logits: false,
+            exclude_input_from_output: !body.echo,
+            return_encoder_output: false,
+            return_perf_metrics: false,
+        };
+
+        let guided_decoding = Self::build_guided_decoding_from_completion(body);
+        let max_tokens = body.max_tokens.unwrap_or(2048);
+        let stop = Self::extract_stop_strings(body.stop.as_ref());
+
+        proto::GenerateRequest {
+            request_id,
+            tokenized: Some(proto::TokenizedInput {
+                original_text,
+                input_token_ids: token_ids,
+                query_token_ids: vec![],
+            }),
+            sampling_config: Some(sampling_config),
+            output_config: Some(output_config),
+            max_tokens,
+            streaming: body.stream,
+            stop,
+            stop_token_ids: body.stop_token_ids.clone().unwrap_or_default(),
+            ignore_eos: body.ignore_eos,
+            bad: vec![],
+            bad_token_ids: vec![],
+            guided_decoding,
+            embedding_bias: vec![],
+            lora_config: None,
+            prompt_tuning_config: None,
+            multimodal_input: None,
+            kv_cache_retention: None,
+            disaggregated_params: None,
+            lookahead_config: None,
+            cache_salt_id: None,
+            arrival_time: None,
+        }
+    }
+
+    fn build_sampling_config_from_completion(body: &CompletionRequest) -> proto::SamplingConfig {
+        proto::SamplingConfig {
+            beam_width: 1,
+            num_return_sequences: body.n.unwrap_or(1),
+            top_k: body.top_k.map(|v| v.max(0)),
+            top_p: Some(body.top_p.unwrap_or(1.0)),
+            top_p_min: None,
+            top_p_reset_ids: None,
+            top_p_decay: None,
+            seed: body.seed.map(|s| s as u64),
+            temperature: Some(body.temperature.unwrap_or(1.0)),
+            min_tokens: body.min_tokens,
+            beam_search_diversity_rate: None,
+            repetition_penalty: body.repetition_penalty.or(Some(1.0)),
+            presence_penalty: body.presence_penalty,
+            frequency_penalty: body.frequency_penalty,
+            prompt_ignore_length: None,
+            length_penalty: None,
+            early_stopping: None,
+            no_repeat_ngram_size: None,
+            min_p: body.min_p,
+            beam_width_array: vec![],
+        }
+    }
+
+    fn build_guided_decoding_from_completion(
+        body: &CompletionRequest,
+    ) -> Option<proto::GuidedDecodingParams> {
+        if let Some(ref json_schema) = body.json_schema {
+            return Some(proto::GuidedDecodingParams {
+                guide_type: proto::guided_decoding_params::GuideType::JsonSchema as i32,
+                guide: json_schema.clone(),
+            });
+        }
+        if let Some(ref regex) = body.regex {
+            return Some(proto::GuidedDecodingParams {
+                guide_type: proto::guided_decoding_params::GuideType::Regex as i32,
+                guide: regex.clone(),
+            });
+        }
+        if let Some(ref ebnf) = body.ebnf {
+            return Some(proto::GuidedDecodingParams {
+                guide_type: proto::guided_decoding_params::GuideType::EbnfGrammar as i32,
+                guide: ebnf.clone(),
+            });
+        }
+        None
     }
 
     /// Build a GenerateRequest from ResponsesRequest (OpenAI Responses API)

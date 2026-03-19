@@ -15,6 +15,7 @@ use openai_protocol::{
     common::{
         FunctionCallDelta, StringOrArray, Tool, ToolCallDelta, ToolChoice, ToolChoiceValue, Usage,
     },
+    completion::{CompletionRequest, CompletionStreamChoice, CompletionStreamResponse},
     generate::GenerateRequest,
     messages::{
         self, ContentBlock, ContentBlockDelta, CreateMessageRequest, Message, MessageDelta,
@@ -45,7 +46,7 @@ pub(crate) struct StreamingProcessor {
     reasoning_parser_factory: ReasoningParserFactory,
     configured_tool_parser: Option<String>,
     configured_reasoning_parser: Option<String>,
-    backend_type: &'static str,
+    pub(crate) backend_type: &'static str,
 }
 
 /// Context for generate endpoint streaming - groups config params to reduce function arguments
@@ -2148,5 +2149,326 @@ impl StreamingProcessor {
         }
 
         result
+    }
+
+    // =========================================================================
+    // Completion endpoint streaming
+    // =========================================================================
+
+    /// Process streaming completion response and return SSE response
+    ///
+    /// Produces `CompletionStreamResponse` objects in SSE format compatible with
+    /// the OpenAI `/v1/completions` streaming protocol.
+    pub fn process_streaming_completion(
+        self: Arc<Self>,
+        execution_result: context::ExecutionResult,
+        completion_request: Arc<CompletionRequest>,
+        dispatch: context::DispatchMetadata,
+        tokenizer: Arc<dyn Tokenizer>,
+        pipeline_start: Option<Instant>,
+    ) -> Response {
+        let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
+
+        let stop_params = (
+            completion_request.stop.clone(),
+            completion_request.stop_token_ids.clone(),
+            completion_request.skip_special_tokens,
+            completion_request.no_stop_trim,
+        );
+
+        let request_id = dispatch.request_id.clone();
+        let model = dispatch.model.clone();
+        let created = dispatch.created;
+        let backend_type = self.backend_type;
+
+        match execution_result {
+            context::ExecutionResult::Single { stream } => {
+                let tokenizer = tokenizer.clone();
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "streaming task is fire-and-forget; client disconnect terminates it"
+                )]
+                tokio::spawn(async move {
+                    let result = Self::process_completion_streaming_inner(
+                        tokenizer,
+                        stream,
+                        stop_params,
+                        &request_id,
+                        &model,
+                        created,
+                        backend_type,
+                        &tx,
+                        pipeline_start,
+                    )
+                    .await;
+
+                    if let Err(e) = result {
+                        utils::send_error_sse(&tx, &e, "internal_error");
+                    }
+
+                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+                });
+            }
+            context::ExecutionResult::Dual { prefill, decode } => {
+                let tokenizer = tokenizer.clone();
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "streaming task is fire-and-forget; client disconnect terminates it"
+                )]
+                tokio::spawn(async move {
+                    // For PD mode, drain prefill stream first (we don't use it for completion)
+                    let mut prefill_stream = prefill;
+                    let mut prefill_ok = true;
+                    while let Some(response) = prefill_stream.next().await {
+                        let gen_response = match response {
+                            Ok(r) => r,
+                            Err(e) => {
+                                utils::send_error_sse(
+                                    &tx,
+                                    format!("Prefill stream error: {}", e.message()),
+                                    "internal_error",
+                                );
+                                prefill_ok = false;
+                                break;
+                            }
+                        };
+                        match gen_response.into_response() {
+                            ProtoResponseVariant::Complete(_) => break,
+                            ProtoResponseVariant::Error(error) => {
+                                utils::send_error_sse(
+                                    &tx,
+                                    format!("Prefill error: {}", error.message()),
+                                    "internal_error",
+                                );
+                                prefill_ok = false;
+                                break;
+                            }
+                            _ => continue,
+                        }
+                    }
+
+                    if prefill_ok {
+                        let result = Self::process_completion_streaming_inner(
+                            tokenizer,
+                            *decode,
+                            stop_params,
+                            &request_id,
+                            &model,
+                            created,
+                            backend_type,
+                            &tx,
+                            pipeline_start,
+                        )
+                        .await;
+
+                        if let Err(e) = result {
+                            utils::send_error_sse(&tx, &e, "internal_error");
+                        }
+
+                        // Mark prefill completed only after decode succeeds
+                        prefill_stream.mark_completed();
+                    }
+
+                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+                });
+            }
+            context::ExecutionResult::Embedding { .. } => {
+                utils::send_error_sse(
+                    &tx,
+                    "Embeddings not supported in streaming completion",
+                    "invalid_request_error",
+                );
+                let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+            }
+        }
+
+        build_sse_response(rx)
+    }
+
+    /// Inner streaming loop for completion endpoint
+    #[expect(clippy::too_many_arguments)]
+    async fn process_completion_streaming_inner(
+        tokenizer: Arc<dyn Tokenizer>,
+        mut stream: ProtoStream,
+        stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
+        request_id: &str,
+        model: &str,
+        created: u64,
+        backend_type: &'static str,
+        tx: &UnboundedSender<Result<Bytes, io::Error>>,
+        pipeline_start: Option<Instant>,
+    ) -> Result<(), String> {
+        let start_time = Instant::now();
+        let mut first_token_time: Option<Instant> = None;
+        let mut last_token_time: Option<Instant> = None;
+        let mut itl_observations: Vec<(f64, u64)> = Vec::new();
+        let mut prompt_tokens: Option<u32> = None;
+
+        // Track state per index for n>1 case
+        let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
+        // Per-index stop decoders for n>1 correctness
+        let mut stop_decoders: HashMap<u32, StopSequenceDecoder> = HashMap::new();
+
+        while let Some(response) = stream.next().await {
+            let gen_response = response.map_err(|e| format!("Stream error: {}", e.message()))?;
+
+            match gen_response.into_response() {
+                ProtoResponseVariant::Chunk(chunk) => {
+                    // Track TTFT and ITL timing
+                    let now = Instant::now();
+                    if first_token_time.is_none() {
+                        first_token_time = Some(now);
+                    } else if let Some(last) = last_token_time {
+                        let num_tokens = chunk.token_ids().len() as u64;
+                        if num_tokens > 0 {
+                            let interval = now.duration_since(last).as_secs_f64();
+                            itl_observations.push((interval / num_tokens as f64, num_tokens));
+                        }
+                    }
+                    last_token_time = Some(now);
+
+                    let index = chunk.index();
+                    let completion_tokens = completion_tokens_map.entry(index).or_insert(0);
+                    *completion_tokens += chunk.token_ids().len() as u32;
+
+                    // Get or create per-index stop decoder
+                    let stop_decoder = stop_decoders.entry(index).or_insert_with(|| {
+                        utils::create_stop_decoder(
+                            &tokenizer,
+                            stop_params.0.as_ref(),
+                            stop_params.1.as_ref(),
+                            stop_params.2,
+                            stop_params.3,
+                        )
+                    });
+
+                    // Process through stop decoder
+                    let (chunk_text, stopped) =
+                        Self::process_chunk_tokens(stop_decoder, chunk.token_ids());
+
+                    if !chunk_text.is_empty() {
+                        let stream_response = CompletionStreamResponse {
+                            id: request_id.to_string(),
+                            object: "text_completion".to_string(),
+                            created,
+                            choices: vec![CompletionStreamChoice {
+                                text: chunk_text,
+                                index,
+                                logprobs: None,
+                                finish_reason: None,
+                            }],
+                            model: model.to_string(),
+                            system_fingerprint: None,
+                        };
+
+                        let sse_data = serde_json::to_string(&stream_response)
+                            .map_err(|e| format!("Failed to serialize completion chunk: {e}"))?;
+                        tx.send(Ok(Bytes::from(format!("data: {sse_data}\n\n"))))
+                            .map_err(|_| "Failed to send chunk".to_string())?;
+                    }
+
+                    if stopped {
+                        // Send final chunk with finish reason
+                        let final_response = CompletionStreamResponse {
+                            id: request_id.to_string(),
+                            object: "text_completion".to_string(),
+                            created,
+                            choices: vec![CompletionStreamChoice {
+                                text: String::new(),
+                                index,
+                                logprobs: None,
+                                finish_reason: Some("stop".to_string()),
+                            }],
+                            model: model.to_string(),
+                            system_fingerprint: None,
+                        };
+
+                        let sse_data = serde_json::to_string(&final_response)
+                            .map_err(|e| format!("Failed to serialize completion finish: {e}"))?;
+                        tx.send(Ok(Bytes::from(format!("data: {sse_data}\n\n"))))
+                            .map_err(|_| "Failed to send finish chunk".to_string())?;
+                    }
+                }
+                ProtoResponseVariant::Complete(complete) => {
+                    let index = complete.index();
+
+                    // Capture prompt_tokens for metrics
+                    prompt_tokens = Some(complete.prompt_tokens());
+
+                    // Flush any remaining text from per-index stop decoder
+                    let flush_text = match stop_decoders.get_mut(&index).map(|sd| sd.flush()) {
+                        Some(SequenceDecoderOutput::Text(t)) => t,
+                        _ => String::new(),
+                    };
+
+                    if !flush_text.is_empty() {
+                        let stream_response = CompletionStreamResponse {
+                            id: request_id.to_string(),
+                            object: "text_completion".to_string(),
+                            created,
+                            choices: vec![CompletionStreamChoice {
+                                text: flush_text,
+                                index,
+                                logprobs: None,
+                                finish_reason: None,
+                            }],
+                            model: model.to_string(),
+                            system_fingerprint: None,
+                        };
+
+                        let sse_data = serde_json::to_string(&stream_response)
+                            .map_err(|e| format!("Failed to serialize completion chunk: {e}"))?;
+                        tx.send(Ok(Bytes::from(format!("data: {sse_data}\n\n"))))
+                            .map_err(|_| "Failed to send chunk".to_string())?;
+                    }
+
+                    // Send final chunk with finish_reason
+                    let finish_reason = complete.finish_reason().to_string();
+                    let final_response = CompletionStreamResponse {
+                        id: request_id.to_string(),
+                        object: "text_completion".to_string(),
+                        created,
+                        choices: vec![CompletionStreamChoice {
+                            text: String::new(),
+                            index,
+                            logprobs: None,
+                            finish_reason: Some(finish_reason),
+                        }],
+                        model: model.to_string(),
+                        system_fingerprint: None,
+                    };
+
+                    let sse_data = serde_json::to_string(&final_response)
+                        .map_err(|e| format!("Failed to serialize completion finish: {e}"))?;
+                    tx.send(Ok(Bytes::from(format!("data: {sse_data}\n\n"))))
+                        .map_err(|_| "Failed to send finish chunk".to_string())?;
+                }
+                ProtoResponseVariant::Error(error) => {
+                    return Err(error.message().to_string());
+                }
+                ProtoResponseVariant::None => continue,
+            }
+        }
+
+        stream.mark_completed();
+
+        // Record streaming metrics
+        let total_completion: u32 = completion_tokens_map.values().sum();
+        // TODO: pass itl_observations, e2e_latency, queue_time once grpc_backpressure lands
+        let _itl_observations = itl_observations;
+        let _e2e_latency = pipeline_start.map(|ps| ps.elapsed());
+        let _queue_time = pipeline_start.map(|ps| start_time.saturating_duration_since(ps));
+        Metrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type,
+            model_id: model,
+            endpoint: metrics_labels::ENDPOINT_COMPLETIONS,
+            ttft: first_token_time.map(|t| t.duration_since(start_time)),
+            generation_duration: start_time.elapsed(),
+            input_tokens: prompt_tokens.map(u64::from),
+            output_tokens: total_completion as u64,
+        });
+
+        Ok(())
     }
 }

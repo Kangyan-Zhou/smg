@@ -11,6 +11,7 @@ use std::{
 use openai_protocol::{
     chat::ChatCompletionRequest,
     common::{ResponseFormat, StringOrArray, ToolChoice, ToolChoiceValue},
+    completion::CompletionRequest,
     generate::GenerateRequest,
     messages::CreateMessageRequest,
     responses::ResponsesRequest,
@@ -393,6 +394,84 @@ impl SglangSchedulerClient {
         };
 
         Ok(grpc_request)
+    }
+
+    /// Build a GenerateRequest from OpenAI CompletionRequest (/v1/completions)
+    ///
+    /// Maps CompletionRequest sampling parameters to SGLang proto SamplingParams
+    /// without converting to an intermediate ChatCompletionRequest.
+    #[expect(
+        clippy::unused_self,
+        reason = "method receiver kept for consistent public API"
+    )]
+    pub fn build_generate_request_from_completion(
+        &self,
+        request_id: String,
+        body: &CompletionRequest,
+        original_text: String,
+        token_ids: Vec<u32>,
+    ) -> proto::GenerateRequest {
+        let sampling_params = Self::build_grpc_sampling_params_from_completion(body);
+
+        proto::GenerateRequest {
+            request_id,
+            tokenized: Some(proto::TokenizedInput {
+                original_text,
+                input_ids: token_ids,
+            }),
+            mm_inputs: None,
+            sampling_params: Some(sampling_params),
+            return_logprob: body.logprobs.is_some(),
+            logprob_start_len: -1,
+            top_logprobs_num: body.logprobs.unwrap_or(0) as i32,
+            return_hidden_states: body.return_hidden_states,
+            stream: body.stream,
+            ..Default::default()
+        }
+    }
+
+    /// Build gRPC SamplingParams from CompletionRequest
+    fn build_grpc_sampling_params_from_completion(
+        body: &CompletionRequest,
+    ) -> proto::SamplingParams {
+        let stop_sequences = match &body.stop {
+            Some(StringOrArray::String(s)) => vec![s.clone()],
+            Some(StringOrArray::Array(arr)) => arr.clone(),
+            None => vec![],
+        };
+
+        let constraint = if let Some(ref regex) = body.regex {
+            Some(proto::sampling_params::Constraint::Regex(regex.clone()))
+        } else if let Some(ref ebnf) = body.ebnf {
+            Some(proto::sampling_params::Constraint::EbnfGrammar(
+                ebnf.clone(),
+            ))
+        } else {
+            body.json_schema.as_ref().map(|json_schema| {
+                proto::sampling_params::Constraint::JsonSchema(json_schema.clone())
+            })
+        };
+
+        proto::SamplingParams {
+            temperature: body.temperature.unwrap_or(1.0),
+            top_p: body.top_p.unwrap_or(1.0),
+            top_k: body.top_k.unwrap_or(-1),
+            frequency_penalty: body.frequency_penalty.unwrap_or(0.0),
+            presence_penalty: body.presence_penalty.unwrap_or(0.0),
+            repetition_penalty: body.repetition_penalty.unwrap_or(1.0),
+            min_p: body.min_p.unwrap_or(0.0),
+            max_new_tokens: body.max_tokens,
+            min_new_tokens: body.min_tokens.unwrap_or(0),
+            n: body.n.unwrap_or(1),
+            stop: stop_sequences,
+            stop_token_ids: body.stop_token_ids.clone().unwrap_or_default(),
+            ignore_eos: body.ignore_eos,
+            skip_special_tokens: body.skip_special_tokens,
+            no_stop_trim: body.no_stop_trim,
+            spaces_between_special_tokens: true,
+            constraint,
+            ..Default::default()
+        }
     }
 
     /// Build a GenerateRequest from ResponsesRequest (OpenAI Responses API)
