@@ -680,18 +680,19 @@ class GrpcRequestManager:
 
                 cleanup_tasks.append(asyncio.create_task(cleanup(rid)))
 
+        # Execute all queue.put() operations in parallel
+        if put_tasks:
+            await asyncio.gather(*put_tasks, return_exceptions=True)
+
         # Forward load info to DataParallelController for token-aware balancing.
         # Mirrors TokenizerManager._handle_batch_output logic: when dp_size > 1,
         # each scheduler piggybacks its load (num_reqs, num_tokens) on batch output.
         # Without this, DPBudget stays at zero and total_tokens/total_requests
         # policies degenerate to always picking rank 0.
+        # Sent after queue puts so telemetry never delays token delivery.
         if self.server_args.dp_size > 1 and batch_out.load is not None:
             load_update = WatchLoadUpdateReq(loads=[batch_out.load])
             self.send_to_scheduler.send_pyobj(load_update)
-
-        # Execute all queue.put() operations in parallel
-        if put_tasks:
-            await asyncio.gather(*put_tasks, return_exceptions=True)
 
     async def _handle_embedding_output(self, batch_out: BatchEmbeddingOutput):
         """Handle batch embedding output from scheduler."""
