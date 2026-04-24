@@ -5,15 +5,44 @@ use pyo3::prelude::*;
 use smg::*;
 use smg_auth as auth;
 
-/// Wrap a Python-provided single label-selector map into the Rust-side list of
-/// pools. An empty map yields an empty list so `Default::default()` semantics
-/// are preserved (i.e. "no discovery filtering configured").
-fn wrap_selector_as_pool(selector: &HashMap<String, String>) -> Vec<HashMap<String, String>> {
-    if selector.is_empty() {
-        Vec::new()
-    } else {
-        vec![selector.clone()]
+/// Parse additional `--selector-pool` values (comma-separated `k=v` strings)
+/// into individual label-selector pools. An entry that produces an empty pool
+/// (all pairs malformed) is dropped.
+fn parse_selector_pool_strings(pools: &[String]) -> Vec<HashMap<String, String>> {
+    pools
+        .iter()
+        .filter_map(|raw| {
+            let mut pool = HashMap::new();
+            for pair in raw.split(',') {
+                let pair = pair.trim();
+                if pair.is_empty() {
+                    continue;
+                }
+                if let Some(eq_pos) = pair.find('=') {
+                    pool.insert(
+                        pair[..eq_pos].trim().to_string(),
+                        pair[eq_pos + 1..].trim().to_string(),
+                    );
+                }
+            }
+            (!pool.is_empty()).then_some(pool)
+        })
+        .collect()
+}
+
+/// Combine the legacy single-map selector (from Python `--selector`) with any
+/// additional pools (from Python `--selector-pool`) into one list. The single
+/// map contributes at most one pool, prepended if non-empty.
+fn combine_selector_pools(
+    single: &HashMap<String, String>,
+    pools: &[String],
+) -> Vec<HashMap<String, String>> {
+    let mut out = Vec::new();
+    if !single.is_empty() {
+        out.push(single.clone());
     }
+    out.extend(parse_selector_pool_strings(pools));
+    out
 }
 
 // Define the enums with PyO3 bindings
@@ -398,10 +427,13 @@ struct Router {
     log_json: bool,
     service_discovery: bool,
     selector: HashMap<String, String>,
+    selector_pool: Vec<String>,
     service_discovery_port: u16,
     service_discovery_namespace: Option<String>,
     prefill_selector: HashMap<String, String>,
+    prefill_selector_pool: Vec<String>,
     decode_selector: HashMap<String, String>,
+    decode_selector_pool: Vec<String>,
     router_selector: HashMap<String, String>,
     bootstrap_port_annotation: String,
     model_id_from: Option<String>,
@@ -588,18 +620,24 @@ impl Router {
         let policy = convert_policy(&self.policy)?;
 
         let discovery = if self.service_discovery {
-            // The Python API still exposes a single HashMap per selector kind.
-            // Wrap each into a single-pool Vec to match the Rust-side plural
-            // schema. Multi-pool usage from Python can be added later by
-            // accepting Vec<HashMap> here.
+            // Python exposes a single HashMap per selector kind (back-compat)
+            // plus a Vec<String> of additional pools (each pool as a
+            // comma-joined "k=v" string). They merge into the Rust plural
+            // schema via combine_selector_pools.
             Some(DiscoveryConfig {
                 enabled: true,
                 namespace: self.service_discovery_namespace.clone(),
                 port: self.service_discovery_port,
                 check_interval_secs: 60,
-                selectors: wrap_selector_as_pool(&self.selector),
-                prefill_selectors: wrap_selector_as_pool(&self.prefill_selector),
-                decode_selectors: wrap_selector_as_pool(&self.decode_selector),
+                selectors: combine_selector_pools(&self.selector, &self.selector_pool),
+                prefill_selectors: combine_selector_pools(
+                    &self.prefill_selector,
+                    &self.prefill_selector_pool,
+                ),
+                decode_selectors: combine_selector_pools(
+                    &self.decode_selector,
+                    &self.decode_selector_pool,
+                ),
                 bootstrap_port_annotation: self.bootstrap_port_annotation.clone(),
                 router_selector: self.router_selector.clone(),
                 router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
@@ -792,10 +830,13 @@ impl Router {
         log_json = false,
         service_discovery = false,
         selector = HashMap::new(),
+        selector_pool = Vec::new(),
         service_discovery_port = 80,
         service_discovery_namespace = None,
         prefill_selector = HashMap::new(),
+        prefill_selector_pool = Vec::new(),
         decode_selector = HashMap::new(),
+        decode_selector_pool = Vec::new(),
         router_selector = HashMap::new(),
         bootstrap_port_annotation = String::from("sglang.ai/bootstrap-port"),
         model_id_from = None,
@@ -901,10 +942,13 @@ impl Router {
         log_json: bool,
         service_discovery: bool,
         selector: HashMap<String, String>,
+        selector_pool: Vec<String>,
         service_discovery_port: u16,
         service_discovery_namespace: Option<String>,
         prefill_selector: HashMap<String, String>,
+        prefill_selector_pool: Vec<String>,
         decode_selector: HashMap<String, String>,
+        decode_selector_pool: Vec<String>,
         router_selector: HashMap<String, String>,
         bootstrap_port_annotation: String,
         model_id_from: Option<String>,
@@ -1019,10 +1063,13 @@ impl Router {
             log_json,
             service_discovery,
             selector,
+            selector_pool,
             service_discovery_port,
             service_discovery_namespace,
             prefill_selector,
+            prefill_selector_pool,
             decode_selector,
+            decode_selector_pool,
             router_selector,
             bootstrap_port_annotation,
             model_id_from,
@@ -1127,13 +1174,19 @@ impl Router {
         let service_discovery_config = if self.service_discovery {
             Some(service_discovery::ServiceDiscoveryConfig {
                 enabled: true,
-                selectors: wrap_selector_as_pool(&self.selector),
+                selectors: combine_selector_pools(&self.selector, &self.selector_pool),
                 check_interval: std::time::Duration::from_secs(60),
                 port: self.service_discovery_port,
                 namespace: self.service_discovery_namespace.clone(),
                 pd_mode: self.pd_disaggregation,
-                prefill_selectors: wrap_selector_as_pool(&self.prefill_selector),
-                decode_selectors: wrap_selector_as_pool(&self.decode_selector),
+                prefill_selectors: combine_selector_pools(
+                    &self.prefill_selector,
+                    &self.prefill_selector_pool,
+                ),
+                decode_selectors: combine_selector_pools(
+                    &self.decode_selector,
+                    &self.decode_selector_pool,
+                ),
                 bootstrap_port_annotation: self.bootstrap_port_annotation.clone(),
                 router_selector: self.router_selector.clone(),
                 router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),

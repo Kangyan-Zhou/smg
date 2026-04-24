@@ -51,11 +51,18 @@ class RouterArgs:
     # Service discovery configuration
     service_discovery: bool = False
     selector: dict[str, str] = dataclasses.field(default_factory=dict)
+    # Additional selector pools for multi-engine discovery. Each entry is a
+    # comma-separated "k=v" string defining one pool; a pod is included if
+    # it matches any pool. Use alongside `selector` (which contributes a
+    # single pool) to cover engines with different label sets.
+    selector_pool: list[str] = dataclasses.field(default_factory=list)
     service_discovery_port: int = 80
     service_discovery_namespace: str | None = None
     # PD service discovery configuration
     prefill_selector: dict[str, str] = dataclasses.field(default_factory=dict)
+    prefill_selector_pool: list[str] = dataclasses.field(default_factory=list)
     decode_selector: dict[str, str] = dataclasses.field(default_factory=dict)
+    decode_selector_pool: list[str] = dataclasses.field(default_factory=list)
     router_selector: dict[str, str] = dataclasses.field(default_factory=dict)
     bootstrap_port_annotation: str = "sglang.ai/bootstrap-port"
     model_id_from: str | None = None
@@ -487,6 +494,18 @@ class RouterArgs:
             help="Label selector for Kubernetes service discovery (format: key1=value1 key2=value2)",
         )
         k8s_group.add_argument(
+            f"--{prefix}selector-pool",
+            type=str,
+            action="append",
+            default=[],
+            help=(
+                "Additional label-selector pool (format: 'key1=value1,key2=value2'). May be"
+                " repeated; each occurrence defines one pool. A pod is included if it matches"
+                " any pool. Use alongside --selector to discover engines that carry different"
+                " label sets."
+            ),
+        )
+        k8s_group.add_argument(
             f"--{prefix}service-discovery-port",
             type=int,
             default=RouterArgs.service_discovery_port,
@@ -511,12 +530,32 @@ class RouterArgs:
             ),
         )
         k8s_group.add_argument(
+            f"--{prefix}prefill-selector-pool",
+            type=str,
+            action="append",
+            default=[],
+            help=(
+                "Additional prefill selector pool for PD mode"
+                " (format: 'key1=value1,key2=value2'), repeatable."
+            ),
+        )
+        k8s_group.add_argument(
             f"--{prefix}decode-selector",
             type=str,
             nargs="+",
             default={},
             help=(
                 "Label selector for decode server pods in PD mode (format: key1=value1 key2=value2)"
+            ),
+        )
+        k8s_group.add_argument(
+            f"--{prefix}decode-selector-pool",
+            type=str,
+            action="append",
+            default=[],
+            help=(
+                "Additional decode selector pool for PD mode"
+                " (format: 'key1=value1,key2=value2'), repeatable."
             ),
         )
         k8s_group.add_argument(
@@ -1157,11 +1196,18 @@ class RouterArgs:
             cli_args_dict.get(f"{prefix}decode", None)
         )
         args_dict["selector"] = cls._parse_selector(cli_args_dict.get(f"{prefix}selector", None))
+        args_dict["selector_pool"] = list(cli_args_dict.get(f"{prefix}selector_pool") or [])
         args_dict["prefill_selector"] = cls._parse_selector(
             cli_args_dict.get(f"{prefix}prefill_selector", None)
         )
+        args_dict["prefill_selector_pool"] = list(
+            cli_args_dict.get(f"{prefix}prefill_selector_pool") or []
+        )
         args_dict["decode_selector"] = cls._parse_selector(
             cli_args_dict.get(f"{prefix}decode_selector", None)
+        )
+        args_dict["decode_selector_pool"] = list(
+            cli_args_dict.get(f"{prefix}decode_selector_pool") or []
         )
         args_dict["router_selector"] = cls._parse_selector(
             cli_args_dict.get(f"{prefix}router_selector", None)
