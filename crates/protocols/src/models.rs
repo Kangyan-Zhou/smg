@@ -21,6 +21,13 @@ pub struct ModelObject {
     pub created: i64,
     /// Who owns/hosts the model.
     pub owned_by: String,
+    /// High-level capability: "diffusion", "vlm", or "llm".
+    /// Absent for upstream-discovered models where we don't have metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_type: Option<String>,
+    /// Diffusion task type (e.g. "T2V", "I2V", "T2I"). Only set for diffusion models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_type: Option<String>,
 }
 
 /// Response body for `GET /v1/models`.

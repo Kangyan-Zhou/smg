@@ -18,10 +18,14 @@
 //!   coupling to the `Worker` trait — it lived in `worker/` for
 //!   historical reasons before this extraction.
 //! - [`background`] — background-mode response scaffolding.
+//! - [`multipart`] — raw multipart/form-data field extraction for
+//!   forwarding diffusion payloads (/v1/videos, /v1/images/edits) to
+//!   workers without re-encoding the body.
 
 pub mod background;
 pub mod header_utils;
 pub mod mcp_utils;
+pub mod multipart;
 pub mod persistence_utils;
 pub mod retry;
 pub mod worker_selection;

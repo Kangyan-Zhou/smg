@@ -8,7 +8,7 @@ use std::{
 
 use axum::{
     extract::{multipart::MultipartError, Extension, Multipart, Path, Query, Request, State},
-    http::{header::InvalidHeaderName, HeaderMap, StatusCode},
+    http::{self, header::InvalidHeaderName, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
@@ -58,6 +58,7 @@ use crate::{
         otel_trace,
     },
     routers::{
+        common::multipart::extract_model_from_multipart,
         conversations,
         mesh::{
             get_app_config, get_cluster_status, get_global_rate_limit, get_global_rate_limit_stats,
@@ -105,6 +106,177 @@ async fn parse_reasoning(
 
 async fn sink_handler() -> Response {
     StatusCode::NOT_FOUND.into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Diffusion endpoint handlers — /v1/videos and /v1/images/*
+//
+// Diffusion request bodies can be large (multi-MB multipart video uploads)
+// and we don't have typed request models for them the way we do for
+// chat/responses/etc. These handlers read the raw body, look up the target
+// `model` either from the JSON payload or from the multipart `model` field,
+// and hand it to the router's `route_raw_request` which forwards the bytes
+// verbatim to the selected worker.
+// ---------------------------------------------------------------------------
+
+/// Hard cap for diffusion request bodies — covers large image/video uploads.
+const MAX_DIFFUSION_BODY_BYTES: usize = 500 * 1024 * 1024;
+
+/// Buffer the full request body, enforcing [`MAX_DIFFUSION_BODY_BYTES`].
+async fn read_body(req: Request) -> Result<bytes::Bytes, Response> {
+    axum::body::to_bytes(req.into_body(), MAX_DIFFUSION_BODY_BYTES)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Failed to read request body: {e}"),
+            )
+                .into_response()
+        })
+}
+
+/// Pull the `model` field from a diffusion payload without re-encoding it.
+///
+/// Multipart payloads (image/video uploads) carry `model` as a form field;
+/// JSON payloads put it at the top level like every other LLM endpoint.
+fn extract_model_from_payload(body: &bytes::Bytes, content_type: &str) -> Option<String> {
+    if content_type.contains("multipart/form-data") {
+        extract_model_from_multipart(body, content_type)
+    } else {
+        serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|v| v.get("model")?.as_str().map(str::to_string))
+    }
+}
+
+/// POST /v1/videos — create a video generation job (multipart or JSON).
+async fn v1_videos_create(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    let route = req.uri().path().to_string();
+    let method = req.method().clone();
+    let content_type = req
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let headers = req.headers().clone();
+
+    let body = match read_body(req).await {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+
+    let model_id = extract_model_from_payload(&body, &content_type);
+    state
+        .router
+        .route_raw_request(Some(&headers), body, &route, model_id.as_deref(), &method)
+        .await
+}
+
+/// GET /v1/videos — list video jobs. No model needed; proxy to any worker.
+async fn v1_videos_list(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    let route = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/v1/videos")
+        .to_string();
+    let method = req.method().clone();
+    let headers = req.headers().clone();
+    state
+        .router
+        .route_raw_request(Some(&headers), bytes::Bytes::new(), &route, None, &method)
+        .await
+}
+
+/// GET /v1/videos/{id} — poll job status. Proxy to any worker.
+async fn v1_videos_get(
+    State(state): State<Arc<AppState>>,
+    Path(video_id): Path<String>,
+    req: Request,
+) -> Response {
+    let route = format!("/v1/videos/{video_id}");
+    let method = req.method().clone();
+    let headers = req.headers().clone();
+    state
+        .router
+        .route_raw_request(Some(&headers), bytes::Bytes::new(), &route, None, &method)
+        .await
+}
+
+/// DELETE /v1/videos/{id} — cancel/delete a job.
+async fn v1_videos_delete(
+    State(state): State<Arc<AppState>>,
+    Path(video_id): Path<String>,
+    req: Request,
+) -> Response {
+    let route = format!("/v1/videos/{video_id}");
+    let method = req.method().clone();
+    let headers = req.headers().clone();
+    state
+        .router
+        .route_raw_request(Some(&headers), bytes::Bytes::new(), &route, None, &method)
+        .await
+}
+
+/// GET /v1/videos/{id}/content — download completed video.
+async fn v1_videos_content(
+    State(state): State<Arc<AppState>>,
+    Path(video_id): Path<String>,
+    req: Request,
+) -> Response {
+    let route = format!("/v1/videos/{video_id}/content");
+    let method = req.method().clone();
+    let headers = req.headers().clone();
+    state
+        .router
+        .route_raw_request(Some(&headers), bytes::Bytes::new(), &route, None, &method)
+        .await
+}
+
+/// POST /v1/images/edits — image editing (multipart/form-data).
+async fn v1_images_edits(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    let route = "/v1/images/edits".to_string();
+    let method = req.method().clone();
+    let content_type = req
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let headers = req.headers().clone();
+
+    let body = match read_body(req).await {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+
+    let model_id = extract_model_from_multipart(&body, &content_type);
+    state
+        .router
+        .route_raw_request(Some(&headers), body, &route, model_id.as_deref(), &method)
+        .await
+}
+
+/// POST /v1/images/generations — image generation (JSON body, same as LLM routes).
+async fn v1_images_generations(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    let route = "/v1/images/generations".to_string();
+    let method = req.method().clone();
+    let headers = req.headers().clone();
+
+    let body = match read_body(req).await {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+
+    let model_id = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|v| v.get("model")?.as_str().map(str::to_string));
+
+    state
+        .router
+        .route_raw_request(Some(&headers), body, &route, model_id.as_deref(), &method)
+        .await
 }
 
 async fn liveness() -> Response {
@@ -1020,6 +1192,21 @@ pub fn build_app(
     // before reaching the handler.
     let multipart_upload_routes = Router::new()
         .route("/v1/audio/transcriptions", post(v1_audio_transcriptions))
+        // Diffusion endpoints — video generation. POST is multipart/JSON,
+        // management verbs are proxied verbatim to the worker. Kept outside
+        // the WASM middleware for the same reason as audio: bodies can be
+        // larger than the default WASM max_body_size (10 MB).
+        .route("/v1/videos", post(v1_videos_create).get(v1_videos_list))
+        .route(
+            "/v1/videos/{video_id}",
+            get(v1_videos_get).delete(v1_videos_delete),
+        )
+        .route("/v1/videos/{video_id}/content", get(v1_videos_content))
+        // Diffusion endpoints — image generation. `/edits` is multipart,
+        // `/generations` is JSON but shares the same raw-forwarding path so
+        // we keep them together outside WASM.
+        .route("/v1/images/generations", post(v1_images_generations))
+        .route("/v1/images/edits", post(v1_images_edits))
         .route_layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
             middleware::concurrency_limit_middleware,

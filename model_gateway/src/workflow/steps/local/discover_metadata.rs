@@ -63,6 +63,8 @@ pub struct ModelInfo {
     pub has_audio_understanding: Option<bool>,
     pub model_type: Option<String>,
     pub architectures: Option<Vec<String>>,
+    /// Diffusion task type (e.g. "T2V", "I2V", "T2I"). Only set for diffusion workers.
+    pub task_type: Option<String>,
 }
 
 /// Single entry from `/v1/models` (shared by sglang and vllm).

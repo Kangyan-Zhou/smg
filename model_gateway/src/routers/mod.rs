@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::Request,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
 };
 use openai_protocol::{
@@ -305,6 +305,28 @@ pub trait RouterTrait: Send + Sync + Debug {
         (
             StatusCode::NOT_IMPLEMENTED,
             "Realtime WebRTC not implemented",
+        )
+            .into_response()
+    }
+
+    /// Route a raw request (multipart, binary, etc.) to a worker by `model_id`.
+    ///
+    /// Used as a fallback for endpoints we don't have typed handlers for —
+    /// e.g. `/v1/videos` and `/v1/images/edits` which forward a
+    /// `multipart/form-data` body directly to the selected worker without
+    /// re-encoding. The `route` is the upstream path (e.g. `/v1/videos`),
+    /// `method` preserves the HTTP verb, and `body` carries the raw bytes.
+    async fn route_raw_request(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: bytes::Bytes,
+        _route: &str,
+        _model_id: Option<&str>,
+        _method: &Method,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Raw request routing not implemented",
         )
             .into_response()
     }

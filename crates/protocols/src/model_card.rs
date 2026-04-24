@@ -25,6 +25,18 @@ fn default_model_type() -> ModelType {
     ModelType::LLM
 }
 
+/// Derive a client-facing capability string ("diffusion" / "vlm" / "llm")
+/// from the worker's hf model type and bitflag capabilities. Diffusion wins
+/// over vision because a text-to-video worker is still a diffusion worker
+/// even if it happens to accept image conditioning.
+fn capability_string(hf_model_type: Option<&str>, model_type: ModelType) -> &'static str {
+    match hf_model_type {
+        Some(t) if t.eq_ignore_ascii_case("diffusion") => "diffusion",
+        _ if model_type.supports_vision() => "vlm",
+        _ => "llm",
+    }
+}
+
 /// Model card containing model configuration and capabilities.
 ///
 /// # Example
@@ -69,6 +81,11 @@ pub struct ModelCard {
     /// Model architectures from HuggingFace config (e.g., ["LlamaForCausalLM"])
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub architectures: Vec<String>,
+
+    /// Diffusion task type (e.g. "T2V", "I2V", "T2I").
+    /// Only set for diffusion workers; surfaced in the `/v1/models` response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_type: Option<String>,
 
     /// Provider hint for API transformations.
     /// `None` means native/passthrough (no transformation needed).
@@ -123,6 +140,7 @@ impl ModelCard {
             model_type: ModelType::LLM,
             hf_model_type: None,
             architectures: Vec::new(),
+            task_type: None,
             provider: None,
             context_length: None,
             tokenizer_path: None,
@@ -133,6 +151,12 @@ impl ModelCard {
             id2label: HashMap::new(),
             num_labels: 0,
         }
+    }
+
+    /// Set the diffusion task type (e.g. "T2V", "I2V", "T2I")
+    pub fn with_task_type(mut self, task_type: impl Into<String>) -> Self {
+        self.task_type = Some(task_type.into());
+        self
     }
 
     // === Builder-style methods ===
@@ -299,13 +323,21 @@ impl ModelCard {
 
     /// Convert this model card into an OpenAI-compatible [`ModelObject`],
     /// consuming `self` to avoid cloning the model ID.
+    ///
+    /// Derives a high-level `model_type` capability string from the card's
+    /// hf-reported type and vision flag so clients can distinguish
+    /// diffusion/VLM/LLM workers without decoding the bitflag. `task_type`
+    /// (e.g. "T2V") carries through for diffusion workers.
     pub fn into_model_object(self) -> ModelObject {
         let owned_by = self.owned_by().to_owned();
+        let capability = capability_string(self.hf_model_type.as_deref(), self.model_type);
         ModelObject {
             id: self.id,
             object: "model".to_owned(),
             created: 0,
             owned_by,
+            model_type: Some(capability.to_owned()),
+            task_type: self.task_type,
         }
     }
 

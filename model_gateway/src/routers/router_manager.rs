@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::Request,
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{self, header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -822,6 +822,25 @@ impl RouterTrait for RouterManager {
                 "No router available for realtime WebRTC request",
             )
                 .into_response()
+        }
+    }
+
+    async fn route_raw_request(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: bytes::Bytes,
+        route: &str,
+        model_id: Option<&str>,
+        method: &http::Method,
+    ) -> Response {
+        let router = self.select_router_for_request(headers, model_id);
+
+        if let Some(router) = router {
+            router
+                .route_raw_request(headers, body, route, model_id, method)
+                .await
+        } else {
+            (StatusCode::NOT_FOUND, "No router available for raw request").into_response()
         }
     }
 

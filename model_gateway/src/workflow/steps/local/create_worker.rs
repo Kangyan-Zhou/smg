@@ -212,6 +212,14 @@ fn build_model_card(
             card = card.with_architectures(archs);
         }
     }
+    // Diffusion task type (e.g. "T2V", "I2V", "T2I") — carried from worker
+    // `/model_info` and surfaced in the `/v1/models` response so clients can
+    // pick an appropriate endpoint.
+    if card.task_type.is_none() {
+        if let Some(task) = labels.get("task_type").filter(|s| !s.is_empty()) {
+            card = card.with_task_type(task.clone());
+        }
+    }
 
     // Classification model id2label
     if let Some(json) = labels.get("id2label_json").filter(|s| !s.is_empty()) {
