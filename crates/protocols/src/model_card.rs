@@ -327,17 +327,24 @@ impl ModelCard {
     /// Derives a high-level `model_type` capability string from the card's
     /// hf-reported type and vision flag so clients can distinguish
     /// diffusion/VLM/LLM workers without decoding the bitflag. `task_type`
-    /// (e.g. "T2V") carries through for diffusion workers.
+    /// (e.g. "T2V") carries through for diffusion workers; when the worker
+    /// did not advertise a task type we fall back to the capability string
+    /// so the field is always populated — clients can then key off a single
+    /// field regardless of backend.
     pub fn into_model_object(self) -> ModelObject {
         let owned_by = self.owned_by().to_owned();
         let capability = capability_string(self.hf_model_type.as_deref(), self.model_type);
+        let task_type = self
+            .task_type
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| capability.to_owned());
         ModelObject {
             id: self.id,
             object: "model".to_owned(),
             created: 0,
             owned_by,
             model_type: Some(capability.to_owned()),
-            task_type: self.task_type,
+            task_type: Some(task_type),
         }
     }
 
@@ -365,5 +372,50 @@ impl Default for ModelCard {
 impl std::fmt::Display for ModelCard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.name())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_type_falls_back_to_capability_when_missing() {
+        // Diffusion worker that did NOT advertise a task_type — the output
+        // should still populate task_type with the capability string.
+        let card = ModelCard::new("m1").with_hf_model_type("diffusion");
+        let obj = card.into_model_object();
+        assert_eq!(obj.model_type.as_deref(), Some("diffusion"));
+        assert_eq!(obj.task_type.as_deref(), Some("diffusion"));
+    }
+
+    #[test]
+    fn task_type_falls_back_to_capability_when_empty_string() {
+        // An empty string is treated the same as `None` to avoid clients
+        // seeing an empty value when upstream misreports.
+        let card = ModelCard::new("m2")
+            .with_hf_model_type("diffusion")
+            .with_task_type("");
+        let obj = card.into_model_object();
+        assert_eq!(obj.task_type.as_deref(), Some("diffusion"));
+    }
+
+    #[test]
+    fn task_type_is_preserved_when_set() {
+        let card = ModelCard::new("m3")
+            .with_hf_model_type("diffusion")
+            .with_task_type("T2V");
+        let obj = card.into_model_object();
+        assert_eq!(obj.task_type.as_deref(), Some("T2V"));
+    }
+
+    #[test]
+    fn llm_worker_without_task_type_gets_llm_capability() {
+        // Plain LLM worker — no hf_model_type, no task_type — both fields
+        // end up as "llm" so clients always have a value.
+        let card = ModelCard::new("m4");
+        let obj = card.into_model_object();
+        assert_eq!(obj.model_type.as_deref(), Some("llm"));
+        assert_eq!(obj.task_type.as_deref(), Some("llm"));
     }
 }
