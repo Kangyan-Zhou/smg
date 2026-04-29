@@ -278,6 +278,7 @@ impl TestWorkerConfig {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }
     }
 
@@ -294,6 +295,7 @@ impl TestWorkerConfig {
             health_status: HealthStatus::Unhealthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }
     }
 
@@ -305,6 +307,7 @@ impl TestWorkerConfig {
             health_status: HealthStatus::Healthy,
             response_delay_ms: delay_ms,
             fail_rate: 0.0,
+            ..Default::default()
         }
     }
 
@@ -323,6 +326,7 @@ impl TestWorkerConfig {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate,
+            ..Default::default()
         }
     }
 
@@ -334,6 +338,7 @@ impl TestWorkerConfig {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }
     }
 
@@ -345,6 +350,7 @@ impl TestWorkerConfig {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }
     }
 }

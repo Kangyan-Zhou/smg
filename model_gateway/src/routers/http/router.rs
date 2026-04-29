@@ -1238,7 +1238,61 @@ impl RouterTrait for Router {
                 );
             }
         };
+        self.forward_raw_request(headers, body, route, &worker, method)
+            .await
+    }
 
+    async fn pick_worker_url_for_model(
+        &self,
+        headers: Option<&HeaderMap>,
+        model_id: Option<&str>,
+    ) -> Option<String> {
+        let selector = model_id.unwrap_or(crate::worker::UNKNOWN_MODEL_ID);
+        self.select_worker_for_model(selector, None, headers)
+            .map(|w| w.url().to_string())
+    }
+
+    async fn route_raw_request_to_worker_url(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: bytes::Bytes,
+        route: &str,
+        worker_url: &str,
+        method: &Method,
+    ) -> Response {
+        let Some(worker) = self.worker_registry.get_by_url(worker_url) else {
+            return error::service_unavailable(
+                "worker_not_found",
+                format!("Worker {worker_url} no longer registered"),
+            );
+        };
+        if !worker.is_available() {
+            return error::service_unavailable(
+                "worker_unavailable",
+                format!("Worker {worker_url} is not available"),
+            );
+        }
+        self.forward_raw_request(headers, body, route, &worker, method)
+            .await
+    }
+
+    fn router_type(&self) -> &'static str {
+        "regular"
+    }
+}
+
+impl Router {
+    /// Forward a raw request body to a specific worker. Shared by
+    /// [`Self::route_raw_request`] (which selects via policy) and
+    /// [`Self::route_raw_request_to_worker_url`] (which uses a known URL).
+    async fn forward_raw_request(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: bytes::Bytes,
+        route: &str,
+        worker: &Arc<dyn Worker>,
+        method: &Method,
+    ) -> Response {
         let url = worker.endpoint_url(route);
 
         // Build the request, preserving the original method, Content-Type and
@@ -1294,10 +1348,6 @@ impl RouterTrait for Router {
                 format!("Failed to read raw response body: {e}"),
             ),
         }
-    }
-
-    fn router_type(&self) -> &'static str {
-        "regular"
     }
 }
 
@@ -1379,5 +1429,65 @@ mod tests {
 
         let worker = router.worker_registry.get_by_url(&url).unwrap();
         assert!(worker.is_healthy());
+    }
+
+    #[tokio::test]
+    async fn pick_worker_url_returns_a_registered_url() {
+        let router = create_test_regular_router();
+        let url = router.pick_worker_url_for_model(None, None).await;
+        assert!(url.is_some(), "should pick a worker when any are available");
+        let url = url.unwrap();
+        assert!(
+            router.worker_registry.get_by_url(&url).is_some(),
+            "picked URL must come from the registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn pick_worker_url_returns_none_when_no_workers_available() {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        let router = Router {
+            worker_registry,
+            policy_registry,
+            client: Client::new(),
+            retry_config: RetryConfig::default(),
+        };
+        assert!(router.pick_worker_url_for_model(None, None).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn route_raw_request_to_unknown_url_returns_503() {
+        let router = create_test_regular_router();
+        let response = router
+            .route_raw_request_to_worker_url(
+                None,
+                bytes::Bytes::new(),
+                "/v1/videos/abc",
+                "http://does-not-exist:9999",
+                &Method::GET,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn route_raw_request_to_unhealthy_worker_returns_503() {
+        let router = create_test_regular_router();
+        let workers = router.worker_registry.get_all();
+        workers[0].set_status(openai_protocol::worker::WorkerStatus::NotReady);
+        let url = workers[0].url().to_string();
+        let response = router
+            .route_raw_request_to_worker_url(
+                None,
+                bytes::Bytes::new(),
+                "/v1/videos/abc",
+                &url,
+                &Method::GET,
+            )
+            .await;
+        // Stale entry pointing at a now-unavailable worker should surface as 503,
+        // which lets the diffusion handler evict its sticky entry and fall back.
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

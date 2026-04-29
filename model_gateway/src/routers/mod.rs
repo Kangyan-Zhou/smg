@@ -331,6 +331,47 @@ pub trait RouterTrait: Send + Sync + Debug {
             .into_response()
     }
 
+    /// Pick a worker URL for `model_id` using the same selection logic as
+    /// [`route_raw_request`], but without forwarding any request. Returns
+    /// `None` when no healthy worker matches.
+    ///
+    /// Diffusion handlers use this to record `task_id → worker_url` in the
+    /// sticky map after the upstream POST succeeds, so subsequent GET / DELETE
+    /// / `/content` calls can skip the policy-driven re-selection.
+    async fn pick_worker_url_for_model(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _model_id: Option<&str>,
+    ) -> Option<String> {
+        None
+    }
+
+    /// Forward a raw request to the worker at `worker_url` instead of
+    /// running the registry's selection policy. Used by diffusion follow-up
+    /// requests that already know which worker owns the task.
+    ///
+    /// Returns `503` with `X-SMG-Error-Code: worker_not_found` if `worker_url`
+    /// is unknown to the registry, or `worker_unavailable` if the worker is
+    /// registered but unhealthy / circuit-broken. Callers holding a sticky
+    /// reference should drop it on either code and fall back to
+    /// [`route_raw_request`]. Status codes from the upstream worker pass
+    /// through verbatim and do not carry that header — distinguish via
+    /// [`crate::routers::error::extract_error_code_from_response`].
+    async fn route_raw_request_to_worker_url(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: bytes::Bytes,
+        _route: &str,
+        _worker_url: &str,
+        _method: &Method,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Raw request routing to specific worker not implemented",
+        )
+            .into_response()
+    }
+
     /// Get router type name
     fn router_type(&self) -> &'static str;
 

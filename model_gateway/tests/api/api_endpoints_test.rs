@@ -41,6 +41,7 @@ mod health_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }])
         .await;
 
@@ -85,6 +86,7 @@ mod health_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                ..Default::default()
             },
             MockWorkerConfig {
                 port: 18004,
@@ -92,6 +94,7 @@ mod health_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                ..Default::default()
             },
         ])
         .await;
@@ -118,6 +121,7 @@ mod health_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }])
         .await;
 
@@ -154,6 +158,7 @@ mod generation_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }])
         .await;
 
@@ -195,6 +200,7 @@ mod generation_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }])
         .await;
 
@@ -231,6 +237,7 @@ mod generation_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 1.0, // Always fail
+            ..Default::default()
         }])
         .await;
 
@@ -262,6 +269,7 @@ mod generation_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }])
         .await;
 
@@ -307,6 +315,7 @@ mod model_info_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }])
         .await;
 
@@ -345,6 +354,7 @@ mod model_info_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }])
         .await;
 
@@ -390,6 +400,7 @@ mod model_info_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }])
         .await;
 
@@ -504,6 +515,7 @@ mod model_info_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                ..Default::default()
             },
             MockWorkerConfig {
                 port: 18205,
@@ -511,6 +523,7 @@ mod model_info_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                ..Default::default()
             },
         ])
         .await;
@@ -548,6 +561,7 @@ mod model_info_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 1.0, // Always fail
+            ..Default::default()
         }])
         .await;
 
@@ -585,6 +599,7 @@ mod router_policy_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                ..Default::default()
             },
             MockWorkerConfig {
                 port: 18802,
@@ -592,6 +607,7 @@ mod router_policy_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                ..Default::default()
             },
         ])
         .await;
@@ -627,6 +643,7 @@ mod router_policy_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }])
         .await;
 
@@ -655,6 +672,7 @@ mod responses_endpoint_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }])
         .await;
 
@@ -694,6 +712,7 @@ mod responses_endpoint_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }])
         .await;
 
@@ -735,6 +754,7 @@ mod responses_endpoint_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }])
         .await;
 
@@ -784,6 +804,7 @@ mod responses_endpoint_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }])
         .await;
 
@@ -833,6 +854,7 @@ mod responses_endpoint_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }])
         .await;
 
@@ -965,6 +987,7 @@ mod responses_endpoint_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                ..Default::default()
             },
             MockWorkerConfig {
                 port: 18961,
@@ -972,6 +995,7 @@ mod responses_endpoint_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                ..Default::default()
             },
         ])
         .await;
@@ -1034,6 +1058,7 @@ mod responses_endpoint_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                ..Default::default()
             }],
         )
         .await
@@ -1208,6 +1233,7 @@ mod error_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }])
         .await;
 
@@ -1245,6 +1271,7 @@ mod error_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }])
         .await;
 
@@ -1300,6 +1327,7 @@ mod error_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                ..Default::default()
             }],
         )
         .await;
@@ -1319,6 +1347,7 @@ mod error_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }])
         .await;
 
@@ -1357,6 +1386,7 @@ mod error_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }])
         .await;
 
@@ -1395,6 +1425,7 @@ mod cache_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }])
         .await;
 
@@ -1433,6 +1464,7 @@ mod cache_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                ..Default::default()
             },
             MockWorkerConfig {
                 port: 18503,
@@ -1440,6 +1472,7 @@ mod cache_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                ..Default::default()
             },
         ])
         .await;
@@ -1503,6 +1536,7 @@ mod load_balancing_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                ..Default::default()
             },
             MockWorkerConfig {
                 port: 18602,
@@ -1510,6 +1544,7 @@ mod load_balancing_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                ..Default::default()
             },
         ])
         .await;
@@ -1557,6 +1592,7 @@ mod pd_mode_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         });
 
         let mut decode_worker = MockWorker::new(MockWorkerConfig {
@@ -1565,6 +1601,7 @@ mod pd_mode_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         });
 
         let prefill_url = prefill_worker.start().await.unwrap();
@@ -1620,6 +1657,7 @@ mod request_id_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }])
         .await;
 
@@ -1740,6 +1778,7 @@ mod request_id_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                ..Default::default()
             }],
         )
         .await;
@@ -1783,6 +1822,7 @@ mod rerank_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }])
         .await;
 
@@ -1835,6 +1875,7 @@ mod rerank_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }])
         .await;
 
@@ -1882,6 +1923,7 @@ mod rerank_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }])
         .await;
 
@@ -1926,6 +1968,7 @@ mod rerank_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 1.0, // Always fail
+            ..Default::default()
         }])
         .await;
 
@@ -1959,6 +2002,7 @@ mod rerank_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }])
         .await;
 
@@ -1998,6 +2042,7 @@ mod rerank_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }])
         .await;
 

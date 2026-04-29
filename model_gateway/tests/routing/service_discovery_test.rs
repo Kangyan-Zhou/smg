@@ -45,6 +45,7 @@ mod service_discovery_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                ..Default::default()
             }],
         )
         .await;
@@ -94,6 +95,7 @@ mod service_discovery_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                ..Default::default()
             }],
         )
         .await;
@@ -154,6 +156,7 @@ mod service_discovery_tests {
                     health_status: HealthStatus::Healthy,
                     response_delay_ms: 0,
                     fail_rate: 0.0,
+                    ..Default::default()
                 },
                 MockWorkerConfig {
                     port: 20004,
@@ -161,6 +164,7 @@ mod service_discovery_tests {
                     health_status: HealthStatus::Healthy,
                     response_delay_ms: 0,
                     fail_rate: 0.0,
+                    ..Default::default()
                 },
             ],
         )
@@ -239,6 +243,7 @@ mod service_discovery_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                ..Default::default()
             }],
         )
         .await;

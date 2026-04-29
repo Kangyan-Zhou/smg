@@ -29,6 +29,7 @@ mod header_forwarding_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }])
         .await;
 
@@ -92,6 +93,7 @@ mod header_forwarding_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                ..Default::default()
             }],
         )
         .await;
@@ -136,6 +138,7 @@ mod header_forwarding_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }])
         .await;
 
@@ -179,6 +182,7 @@ mod header_forwarding_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }])
         .await;
 
@@ -226,6 +230,7 @@ mod header_forwarding_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }])
         .await;
 
@@ -269,6 +274,7 @@ mod header_forwarding_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            ..Default::default()
         }])
         .await;
 

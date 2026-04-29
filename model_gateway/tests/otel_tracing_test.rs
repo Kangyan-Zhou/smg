@@ -113,6 +113,7 @@ async fn test_router_with_tracing() {
         health_status: HealthStatus::Healthy,
         response_delay_ms: 0,
         fail_rate: 0.0,
+        ..Default::default()
     });
 
     let worker_url = mock_worker.start().await.unwrap();

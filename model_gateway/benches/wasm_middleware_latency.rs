@@ -79,6 +79,7 @@ fn bench_wasm_middleware_buffering(c: &mut Criterion) {
         concurrency_queue_tx: None,
         router_manager: None,
         mesh_handler: None,
+        diffusion_task_map: smg::diffusion::TaskWorkerMap::new(),
     });
 
     c.bench_function("wasm_middleware_pre_fix_latency", |b| {

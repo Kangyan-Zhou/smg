@@ -188,6 +188,35 @@ impl RouterManager {
         self.routers.len()
     }
 
+    /// Find the router whose worker registry contains the given worker URL.
+    /// Returns `None` when no registered worker matches — in that case the
+    /// caller should fall back to policy-driven selection or surface the 503.
+    pub fn router_owning_worker_url(&self, worker_url: &str) -> Option<Arc<dyn RouterTrait>> {
+        let worker = self.worker_registry.get_by_url(worker_url)?;
+        let is_pd = matches!(
+            worker.worker_type(),
+            WorkerType::Prefill | WorkerType::Decode
+        );
+        let is_grpc = matches!(worker.connection_mode(), ConnectionMode::Grpc);
+        let is_external = matches!(worker.metadata().spec.runtime_type, RuntimeType::External);
+
+        let router_id = if is_external {
+            match worker.provider_for_model(worker.model_id()) {
+                Some(ProviderType::Gemini) => &router_ids::HTTP_GEMINI,
+                Some(ProviderType::Anthropic) => &router_ids::HTTP_ANTHROPIC,
+                _ => &router_ids::HTTP_OPENAI,
+            }
+        } else {
+            match (is_grpc, is_pd) {
+                (true, true) => &router_ids::GRPC_PD,
+                (true, false) => &router_ids::GRPC_REGULAR,
+                (false, true) => &router_ids::HTTP_PD,
+                (false, false) => &router_ids::HTTP_REGULAR,
+            }
+        };
+        self.routers.get(router_id).map(|r| r.clone())
+    }
+
     pub fn get_router_for_model(&self, model_id: &str) -> Option<Arc<dyn RouterTrait>> {
         let workers = self.worker_registry.get_by_model(model_id);
 
@@ -841,6 +870,46 @@ impl RouterTrait for RouterManager {
                 .await
         } else {
             (StatusCode::NOT_FOUND, "No router available for raw request").into_response()
+        }
+    }
+
+    async fn pick_worker_url_for_model(
+        &self,
+        headers: Option<&HeaderMap>,
+        model_id: Option<&str>,
+    ) -> Option<String> {
+        let router = self.select_router_for_request(headers, model_id)?;
+        router.pick_worker_url_for_model(headers, model_id).await
+    }
+
+    async fn route_raw_request_to_worker_url(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: bytes::Bytes,
+        route: &str,
+        worker_url: &str,
+        method: &http::Method,
+    ) -> Response {
+        // Find the router whose registry actually contains the worker. Just
+        // picking the highest-scoring router via `select_router_for_request`
+        // is unsafe in IGW mode because that score is unrelated to worker
+        // ownership — in a mixed PD/regular deployment we'd dispatch to a
+        // router whose `get_by_url` lookup would 503, the diffusion handler
+        // would treat the 503 as "evict and round-robin", and the sticky
+        // entry would be lost.
+        let router = self
+            .router_owning_worker_url(worker_url)
+            .or_else(|| self.select_router_for_request(headers, None));
+        if let Some(router) = router {
+            router
+                .route_raw_request_to_worker_url(headers, body, route, worker_url, method)
+                .await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                "No router available for raw request to worker",
+            )
+                .into_response()
         }
     }
 

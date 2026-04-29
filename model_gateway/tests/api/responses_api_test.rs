@@ -48,6 +48,7 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
         health_status: HealthStatus::Healthy,
         response_delay_ms: 0,
         fail_rate: 0.0,
+        ..Default::default()
     });
     let worker_url = worker.start().await.expect("start worker");
 
@@ -252,6 +253,7 @@ async fn test_non_streaming_mcp_e2e_accepts_forwardable_request_headers() {
         health_status: HealthStatus::Healthy,
         response_delay_ms: 0,
         fail_rate: 0.0,
+        ..Default::default()
     });
     let worker_url = worker.start().await.expect("start worker");
 
@@ -394,6 +396,7 @@ async fn test_non_streaming_mcp_returns_approval_request_when_required() {
         health_status: HealthStatus::Healthy,
         response_delay_ms: 0,
         fail_rate: 0.0,
+        ..Default::default()
     });
     let worker_url = worker.start().await.expect("start worker");
 
@@ -527,6 +530,7 @@ async fn test_final_response_hides_internal_mcp_trace_items() {
         health_status: HealthStatus::Healthy,
         response_delay_ms: 0,
         fail_rate: 0.0,
+        ..Default::default()
     });
     let worker_url = worker.start().await.expect("start worker");
 
@@ -659,6 +663,7 @@ async fn test_previous_response_id_does_not_repeat_mcp_list_tools_for_existing_b
         health_status: HealthStatus::Healthy,
         response_delay_ms: 0,
         fail_rate: 0.0,
+        ..Default::default()
     });
     let worker_url = worker.start().await.expect("start worker");
 
@@ -840,6 +845,7 @@ async fn test_final_response_hides_internal_mcp_error_details() {
         health_status: HealthStatus::Healthy,
         response_delay_ms: 0,
         fail_rate: 0.0,
+        ..Default::default()
     });
     let worker_url = worker.start().await.expect("start worker");
 
@@ -1294,6 +1300,7 @@ async fn test_multi_turn_loop_with_mcp() {
         health_status: HealthStatus::Healthy,
         response_delay_ms: 0,
         fail_rate: 0.0,
+        ..Default::default()
     });
     let worker_url = worker.start().await.expect("start worker");
 
@@ -1458,6 +1465,7 @@ async fn test_max_tool_calls_limit() {
         health_status: HealthStatus::Healthy,
         response_delay_ms: 0,
         fail_rate: 0.0,
+        ..Default::default()
     });
     let worker_url = worker.start().await.expect("start worker");
 
@@ -1593,6 +1601,7 @@ async fn setup_streaming_mcp_test() -> (
         health_status: HealthStatus::Healthy,
         response_delay_ms: 0,
         fail_rate: 0.0,
+        ..Default::default()
     });
     let worker_url = worker.start().await.expect("start worker");
 

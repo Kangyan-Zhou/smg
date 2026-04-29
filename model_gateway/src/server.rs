@@ -7,6 +7,7 @@ use std::{
 };
 
 use axum::{
+    body::Body,
     extract::{multipart::MultipartError, Extension, Multipart, Path, Query, Request, State},
     http::{self, header::InvalidHeaderName, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -49,6 +50,7 @@ use wfaas::LoggingSubscriber;
 use crate::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
+    diffusion::TaskId,
     middleware::{self, AuthConfig, QueuedRequest},
     observability::{
         logging::{self, LoggingConfig},
@@ -59,7 +61,7 @@ use crate::{
     },
     routers::{
         common::multipart::extract_model_from_multipart,
-        conversations,
+        conversations, error,
         mesh::{
             get_app_config, get_cluster_status, get_global_rate_limit, get_global_rate_limit_stats,
             get_mesh_health, get_policy_state, get_policy_states, get_worker_state,
@@ -88,6 +90,8 @@ pub struct AppState {
     pub concurrency_queue_tx: Option<mpsc::Sender<QueuedRequest>>,
     pub router_manager: Option<Arc<RouterManager>>,
     pub mesh_handler: Option<Arc<MeshServerHandler>>,
+    /// Sticky `task_id → worker_url` map for diffusion follow-up requests.
+    pub diffusion_task_map: crate::diffusion::TaskWorkerMap,
 }
 
 async fn parse_function_call(
@@ -111,12 +115,16 @@ async fn sink_handler() -> Response {
 // ---------------------------------------------------------------------------
 // Diffusion endpoint handlers — /v1/videos and /v1/images/*
 //
-// Diffusion request bodies can be large (multi-MB multipart video uploads)
-// and we don't have typed request models for them the way we do for
-// chat/responses/etc. These handlers read the raw body, look up the target
-// `model` either from the JSON payload or from the multipart `model` field,
-// and hand it to the router's `route_raw_request` which forwards the bytes
-// verbatim to the selected worker.
+// Diffusion requests carry the model in the body (`model` form field for
+// multipart, top-level `model` for JSON) or, for backwards compatibility with
+// the playground README, in the `?model=` query string. POSTs are routed to a
+// worker that hosts the model; for `/v1/videos` we additionally record the
+// `task_id → worker_url` mapping so subsequent GET / DELETE / `/content`
+// requests on that id reach the worker that actually owns the task.
+//
+// `/v1/images/*` endpoints are synchronous (no follow-up GET), so we route
+// them by model but skip the body-buffering needed to extract a task id —
+// that buffering would regress large `b64_json` responses (~3-30 MB).
 // ---------------------------------------------------------------------------
 
 /// Hard cap for diffusion request bodies — covers large image/video uploads.
@@ -135,23 +143,290 @@ async fn read_body(req: Request) -> Result<bytes::Bytes, Response> {
         })
 }
 
+/// Cap on `/v1/videos` POST response bodies we re-buffer to extract the task
+/// id. Real responses are tiny JSON envelopes (a few hundred bytes); 1 MiB is
+/// orders of magnitude over the steady state and protects against an
+/// unexpected media payload mis-routing through this path.
+const MAX_VIDEO_RESPONSE_BYTES: usize = 1024 * 1024;
+
 /// Pull the `model` field from a diffusion payload without re-encoding it.
 ///
-/// Multipart payloads (image/video uploads) carry `model` as a form field;
-/// JSON payloads put it at the top level like every other LLM endpoint.
-fn extract_model_from_payload(body: &bytes::Bytes, content_type: &str) -> Option<String> {
-    if content_type.contains("multipart/form-data") {
+/// Tries the request body first (multipart `model` form field or JSON `model`
+/// key), then falls back to `?model=` in the query string for compatibility
+/// with the documented playground request shape.
+fn extract_model_from_payload(
+    body: &bytes::Bytes,
+    content_type: &str,
+    query: Option<&str>,
+) -> Option<String> {
+    let from_body = if content_type.contains("multipart/form-data") {
         extract_model_from_multipart(body, content_type)
     } else {
         serde_json::from_slice::<Value>(body)
             .ok()
             .and_then(|v| v.get("model")?.as_str().map(str::to_string))
+    };
+    from_body.or_else(|| extract_model_from_query(query?))
+}
+
+/// Extract the `model` key from a URL-encoded query string. Handles both
+/// `+`-as-space and arbitrary `%XX` escapes via the standard parser.
+fn extract_model_from_query(query: &str) -> Option<String> {
+    url::form_urlencoded::parse(query.as_bytes())
+        .find_map(|(k, v)| (k == "model" && !v.is_empty()).then(|| v.into_owned()))
+}
+
+/// Parse a response body for `{"id": "..."}`. Used to record sticky task
+/// routing for `/v1/videos` POSTs. Returns `None` if the body isn't JSON,
+/// lacks a top-level `id`, or `id` isn't a string — in which case we log
+/// the anomaly so a misbehaving upstream is visible to operators.
+fn parse_response_id(body: &bytes::Bytes) -> Option<String> {
+    match serde_json::from_slice::<Value>(body) {
+        Ok(v) => match v.get("id") {
+            Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+            _ => {
+                warn!(
+                    error_id = "diffusion_response_missing_id",
+                    body_len = body.len(),
+                    "diffusion POST response had no top-level string `id`; sticky routing skipped"
+                );
+                None
+            }
+        },
+        Err(e) => {
+            warn!(
+                error_id = "diffusion_response_id_parse_failed",
+                body_len = body.len(),
+                error = %e,
+                "could not parse diffusion response body as JSON; sticky routing skipped"
+            );
+            None
+        }
     }
+}
+
+/// Forward a POST that creates a diffusion task and record the resulting
+/// `task_id → worker_url` mapping for follow-up GET / DELETE / `/content`
+/// requests.
+///
+/// Failure modes:
+/// * `model_id` could not be resolved → `400 diffusion_model_required`. We
+///   do not silently round-robin: that's how the bug this PR fixes was
+///   created in the first place.
+/// * Model resolved but no worker hosts it → `404 model_not_found`.
+/// * Picked worker disappears in the TOCTOU window between selection and
+///   forward (deregister, drain, health flip) → retry once via the
+///   policy-driven path so the user gets a useful response instead of 503.
+/// * Upstream returns non-2xx → forward the response unchanged; record nothing.
+/// * Upstream returns 2xx but the body exceeds [`MAX_VIDEO_RESPONSE_BYTES`]
+///   → log and forward what we have without recording. We never substitute a
+///   500 for a successful upstream because that would silently produce
+///   duplicate tasks on client retry.
+async fn forward_and_record(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: bytes::Bytes,
+    route: &str,
+    model_id: Option<&str>,
+    method: &http::Method,
+) -> Response {
+    let Some(model) = model_id else {
+        return error::bad_request(
+            "diffusion_model_required",
+            "diffusion endpoints require `model` in the request body or `?model=` query",
+        );
+    };
+    let Some(worker_url) = state
+        .router
+        .pick_worker_url_for_model(Some(headers), Some(model))
+        .await
+    else {
+        warn!(
+            error_id = "diffusion_no_worker_for_model",
+            model = model,
+            route = route,
+            "no healthy worker for diffusion model; cannot record sticky routing"
+        );
+        return error::model_not_found(model);
+    };
+
+    let response = state
+        .router
+        .route_raw_request_to_worker_url(Some(headers), body.clone(), route, &worker_url, method)
+        .await;
+
+    // TOCTOU: the worker might have been deregistered (or gone unavailable)
+    // between selection and forward. Detect via the gateway-internal error
+    // code and retry once via the policy-driven path before giving up.
+    if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+        let code = error::extract_error_code_from_response(&response);
+        if matches!(code, "worker_not_found" | "worker_unavailable") {
+            warn!(
+                error_id = "diffusion_post_worker_disappeared",
+                worker_url = %worker_url,
+                model = model,
+                gateway_code = code,
+                "picked worker no longer available; retrying with policy-driven selection"
+            );
+            return state
+                .router
+                .route_raw_request(Some(headers), body, route, Some(model), method)
+                .await;
+        }
+    }
+
+    if !response.status().is_success() {
+        return response;
+    }
+
+    // Re-buffer the body so we can both peek for `id` and forward unchanged.
+    // On overflow, log and forward what we have without recording — never
+    // mask a successful upstream with a synthetic 5xx.
+    let (parts, body) = response.into_parts();
+    let body_bytes = match axum::body::to_bytes(body, MAX_VIDEO_RESPONSE_BYTES).await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(
+                error_id = "diffusion_response_buffer_failed",
+                route = route,
+                worker_url = %worker_url,
+                limit = MAX_VIDEO_RESPONSE_BYTES,
+                error = %e,
+                "could not buffer diffusion response; forwarding without recording sticky entry"
+            );
+            return error::bad_gateway(
+                "diffusion_response_buffer_failed",
+                "diffusion response could not be buffered to record routing; please retry",
+            );
+        }
+    };
+    if let Some(id) = parse_response_id(&body_bytes) {
+        let prior = state
+            .diffusion_task_map
+            .record(&TaskId::from(id), &worker_url);
+        if let Some(prior_url) = prior {
+            if prior_url != worker_url {
+                warn!(
+                    error_id = "diffusion_task_routing_churn",
+                    prior_worker_url = %prior_url,
+                    new_worker_url = %worker_url,
+                    "task id was already routed to a different worker; overwriting"
+                );
+            }
+        }
+    }
+    Response::from_parts(parts, Body::from(body_bytes))
+}
+
+/// Route a diffusion POST that has no follow-up endpoints (`/v1/images/*`).
+/// Picks a worker by model; does not buffer the response or record anything.
+/// We keep this separate from [`forward_and_record`] so synchronous image
+/// generations (which can return ~30 MB of base64) aren't double-buffered.
+async fn forward_diffusion_post_no_record(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: bytes::Bytes,
+    route: &str,
+    model_id: Option<&str>,
+    method: &http::Method,
+) -> Response {
+    let Some(model) = model_id else {
+        return error::bad_request(
+            "diffusion_model_required",
+            "diffusion endpoints require `model` in the request body or `?model=` query",
+        );
+    };
+    state
+        .router
+        .route_raw_request(Some(headers), body, route, Some(model), method)
+        .await
+}
+
+/// Forward a follow-up request (GET / DELETE / `/content`) for an existing
+/// diffusion task, using the sticky map when possible.
+///
+/// Eviction policy:
+/// * Upstream `404` → engine restarted and lost its in-memory store; drop the
+///   sticky entry and forward the 404 to the client.
+/// * Gateway-internal `503` (`worker_not_found` / `worker_unavailable`) →
+///   worker deregistered or unhealthy; drop the entry and fall through to
+///   policy-driven selection so the client gets a successful response if any
+///   worker happens to know the task.
+/// * Other status (5xx upstream, etc.) → return as-is and *keep* the entry.
+///   We log a warning so on-call can see when sticky pinning lands on a
+///   misbehaving worker; consecutive-failure circuit breaking is a follow-up.
+async fn forward_followup(
+    state: &AppState,
+    headers: &HeaderMap,
+    route: &str,
+    method: &http::Method,
+    task_id: &TaskId,
+) -> Response {
+    if let Some(worker_url) = state.diffusion_task_map.get(task_id) {
+        let response = state
+            .router
+            .route_raw_request_to_worker_url(
+                Some(headers),
+                bytes::Bytes::new(),
+                route,
+                &worker_url,
+                method,
+            )
+            .await;
+
+        let status = response.status();
+        if status == StatusCode::NOT_FOUND {
+            // Engine restarted; the task is gone from its in-memory store.
+            state.diffusion_task_map.remove(task_id);
+            return response;
+        }
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            let code = error::extract_error_code_from_response(&response);
+            if matches!(code, "worker_not_found" | "worker_unavailable") {
+                // Gateway-internal: the worker URL no longer routes anywhere.
+                // Evict and fall through to policy-driven selection.
+                warn!(
+                    error_id = "diffusion_sticky_worker_gone",
+                    task_id = %task_id,
+                    worker_url = %worker_url,
+                    "sticky worker no longer registered; falling back to policy-driven routing"
+                );
+                state.diffusion_task_map.remove(task_id);
+            } else {
+                // Upstream-emitted 503 (queue full, draining, model loading).
+                // Likely transient — keep the sticky entry and pass through.
+                warn!(
+                    error_id = "diffusion_sticky_upstream_busy",
+                    task_id = %task_id,
+                    worker_url = %worker_url,
+                    "sticky worker returned upstream 503; preserving sticky entry"
+                );
+                return response;
+            }
+        } else if !status.is_success() {
+            warn!(
+                error_id = "diffusion_sticky_upstream_5xx",
+                task_id = %task_id,
+                worker_url = %worker_url,
+                status = status.as_u16(),
+                "sticky worker returned non-success status; preserving sticky entry"
+            );
+            return response;
+        } else {
+            return response;
+        }
+    }
+
+    state
+        .router
+        .route_raw_request(Some(headers), bytes::Bytes::new(), route, None, method)
+        .await
 }
 
 /// POST /v1/videos — create a video generation job (multipart or JSON).
 async fn v1_videos_create(State(state): State<Arc<AppState>>, req: Request) -> Response {
     let route = req.uri().path().to_string();
+    let query = req.uri().query().map(str::to_string);
     let method = req.method().clone();
     let content_type = req
         .headers()
@@ -166,14 +441,14 @@ async fn v1_videos_create(State(state): State<Arc<AppState>>, req: Request) -> R
         Err(e) => return e,
     };
 
-    let model_id = extract_model_from_payload(&body, &content_type);
-    state
-        .router
-        .route_raw_request(Some(&headers), body, &route, model_id.as_deref(), &method)
-        .await
+    let model_id = extract_model_from_payload(&body, &content_type, query.as_deref());
+    forward_and_record(&state, &headers, body, &route, model_id.as_deref(), &method).await
 }
 
-/// GET /v1/videos — list video jobs. No model needed; proxy to any worker.
+/// GET /v1/videos — list video jobs. The list is per-worker (each engine
+/// stores jobs in process-local memory), so this only returns one worker's
+/// view in a multi-engine deployment. Fanning out and merging is a planned
+/// follow-up; tracked via the diffusion task map docs.
 async fn v1_videos_list(State(state): State<Arc<AppState>>, req: Request) -> Response {
     let route = req
         .uri()
@@ -189,7 +464,7 @@ async fn v1_videos_list(State(state): State<Arc<AppState>>, req: Request) -> Res
         .await
 }
 
-/// GET /v1/videos/{id} — poll job status. Proxy to any worker.
+/// GET /v1/videos/{id} — poll job status on the worker that owns it.
 async fn v1_videos_get(
     State(state): State<Arc<AppState>>,
     Path(video_id): Path<String>,
@@ -198,13 +473,11 @@ async fn v1_videos_get(
     let route = format!("/v1/videos/{video_id}");
     let method = req.method().clone();
     let headers = req.headers().clone();
-    state
-        .router
-        .route_raw_request(Some(&headers), bytes::Bytes::new(), &route, None, &method)
-        .await
+    let task_id = TaskId::from(video_id);
+    forward_followup(&state, &headers, &route, &method, &task_id).await
 }
 
-/// DELETE /v1/videos/{id} — cancel/delete a job.
+/// DELETE /v1/videos/{id} — cancel/delete a job on its owning worker.
 async fn v1_videos_delete(
     State(state): State<Arc<AppState>>,
     Path(video_id): Path<String>,
@@ -213,13 +486,16 @@ async fn v1_videos_delete(
     let route = format!("/v1/videos/{video_id}");
     let method = req.method().clone();
     let headers = req.headers().clone();
-    state
-        .router
-        .route_raw_request(Some(&headers), bytes::Bytes::new(), &route, None, &method)
-        .await
+    let task_id = TaskId::from(video_id);
+    let response = forward_followup(&state, &headers, &route, &method, &task_id).await;
+    // Successful delete on the upstream means we should drop our sticky entry too.
+    if response.status().is_success() {
+        state.diffusion_task_map.remove(&task_id);
+    }
+    response
 }
 
-/// GET /v1/videos/{id}/content — download completed video.
+/// GET /v1/videos/{id}/content — download completed video from its owning worker.
 async fn v1_videos_content(
     State(state): State<Arc<AppState>>,
     Path(video_id): Path<String>,
@@ -228,15 +504,15 @@ async fn v1_videos_content(
     let route = format!("/v1/videos/{video_id}/content");
     let method = req.method().clone();
     let headers = req.headers().clone();
-    state
-        .router
-        .route_raw_request(Some(&headers), bytes::Bytes::new(), &route, None, &method)
-        .await
+    let task_id = TaskId::from(video_id);
+    forward_followup(&state, &headers, &route, &method, &task_id).await
 }
 
 /// POST /v1/images/edits — image editing (multipart/form-data).
+/// Synchronous endpoint — no follow-ups, so we don't buffer the response.
 async fn v1_images_edits(State(state): State<Arc<AppState>>, req: Request) -> Response {
     let route = "/v1/images/edits".to_string();
+    let query = req.uri().query().map(str::to_string);
     let method = req.method().clone();
     let content_type = req
         .headers()
@@ -251,17 +527,23 @@ async fn v1_images_edits(State(state): State<Arc<AppState>>, req: Request) -> Re
         Err(e) => return e,
     };
 
-    let model_id = extract_model_from_multipart(&body, &content_type);
-    state
-        .router
-        .route_raw_request(Some(&headers), body, &route, model_id.as_deref(), &method)
+    let model_id = extract_model_from_payload(&body, &content_type, query.as_deref());
+    forward_diffusion_post_no_record(&state, &headers, body, &route, model_id.as_deref(), &method)
         .await
 }
 
-/// POST /v1/images/generations — image generation (JSON body, same as LLM routes).
+/// POST /v1/images/generations — image generation (JSON body).
+/// Synchronous endpoint — no follow-ups, so we don't buffer the response.
 async fn v1_images_generations(State(state): State<Arc<AppState>>, req: Request) -> Response {
     let route = "/v1/images/generations".to_string();
+    let query = req.uri().query().map(str::to_string);
     let method = req.method().clone();
+    let content_type = req
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
     let headers = req.headers().clone();
 
     let body = match read_body(req).await {
@@ -269,13 +551,8 @@ async fn v1_images_generations(State(state): State<Arc<AppState>>, req: Request)
         Err(e) => return e,
     };
 
-    let model_id = serde_json::from_slice::<Value>(&body)
-        .ok()
-        .and_then(|v| v.get("model")?.as_str().map(str::to_string));
-
-    state
-        .router
-        .route_raw_request(Some(&headers), body, &route, model_id.as_deref(), &method)
+    let model_id = extract_model_from_payload(&body, &content_type, query.as_deref());
+    forward_diffusion_post_no_record(&state, &headers, body, &route, model_id.as_deref(), &method)
         .await
 }
 
@@ -1680,12 +1957,15 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .as_ref()
         .map(|c| c.advertise_addr.port());
 
+    let diffusion_task_map = crate::diffusion::TaskWorkerMap::new();
+    diffusion_task_map.spawn_sweeper();
     let app_state = Arc::new(AppState {
         router,
         context: app_context.clone(),
         concurrency_queue_tx: limiter.queue_tx.clone(),
         router_manager: Some(router_manager),
         mesh_handler,
+        diffusion_task_map,
     });
     if let Some(service_discovery_config) = config.service_discovery_config {
         if service_discovery_config.enabled {
@@ -1894,4 +2174,111 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
     };
 
     cors.max_age(Duration::from_secs(3600))
+}
+
+#[cfg(test)]
+mod diffusion_helper_tests {
+    //! Unit tests for the small helpers backing the diffusion sticky-routing
+    //! handlers. The full request flow is covered by router-integration tests.
+
+    use bytes::Bytes;
+
+    use super::{extract_model_from_payload, extract_model_from_query, parse_response_id};
+
+    #[test]
+    fn extract_model_from_json_body() {
+        let body = Bytes::from(r#"{"model":"foo/bar","prompt":"hi"}"#);
+        let model = extract_model_from_payload(&body, "application/json", None);
+        assert_eq!(model.as_deref(), Some("foo/bar"));
+    }
+
+    #[test]
+    fn extract_model_from_multipart_body() {
+        let boundary = "BOUNDARY";
+        let body = Bytes::from(format!(
+            "--{boundary}\r\n\
+             Content-Disposition: form-data; name=\"model\"\r\n\r\n\
+             diffusion/wan-2-2\r\n\
+             --{boundary}--\r\n"
+        ));
+        let model =
+            extract_model_from_payload(&body, "multipart/form-data; boundary=BOUNDARY", None);
+        assert_eq!(model.as_deref(), Some("diffusion/wan-2-2"));
+    }
+
+    #[test]
+    fn falls_back_to_query_when_body_lacks_model() {
+        let body = Bytes::from(r#"{"prompt":"hi"}"#);
+        let model =
+            extract_model_from_payload(&body, "application/json", Some("model=foo%2Fbar&n=1"));
+        assert_eq!(model.as_deref(), Some("foo/bar"));
+    }
+
+    #[test]
+    fn body_takes_precedence_over_query() {
+        let body = Bytes::from(r#"{"model":"from-body"}"#);
+        let model = extract_model_from_payload(&body, "application/json", Some("model=from-query"));
+        assert_eq!(model.as_deref(), Some("from-body"));
+    }
+
+    #[test]
+    fn no_model_anywhere_returns_none() {
+        let body = Bytes::from(r#"{"prompt":"hi"}"#);
+        let model = extract_model_from_payload(&body, "application/json", Some("n=1"));
+        assert!(model.is_none());
+    }
+
+    #[test]
+    fn extract_model_from_query_handles_first_param() {
+        assert_eq!(
+            extract_model_from_query("model=abc&foo=bar").as_deref(),
+            Some("abc")
+        );
+    }
+
+    #[test]
+    fn extract_model_from_query_handles_later_param() {
+        assert_eq!(
+            extract_model_from_query("foo=bar&model=abc").as_deref(),
+            Some("abc")
+        );
+    }
+
+    #[test]
+    fn extract_model_from_query_decodes_percent_slash() {
+        assert_eq!(
+            extract_model_from_query("model=foo%2Fbar%2Fbaz").as_deref(),
+            Some("foo/bar/baz")
+        );
+    }
+
+    #[test]
+    fn extract_model_from_query_returns_none_when_missing() {
+        assert!(extract_model_from_query("foo=bar").is_none());
+    }
+
+    #[test]
+    fn parse_response_id_finds_top_level_id() {
+        let body = Bytes::from(r#"{"id":"task-123","status":"queued"}"#);
+        assert_eq!(parse_response_id(&body).as_deref(), Some("task-123"));
+    }
+
+    #[test]
+    fn parse_response_id_returns_none_when_no_id() {
+        let body = Bytes::from(r#"{"status":"queued"}"#);
+        assert!(parse_response_id(&body).is_none());
+    }
+
+    #[test]
+    fn parse_response_id_returns_none_for_non_json() {
+        let body = Bytes::from(b"<html>error</html>".as_slice());
+        assert!(parse_response_id(&body).is_none());
+    }
+
+    #[test]
+    fn parse_response_id_ignores_non_string_id() {
+        // OpenAI's spec says id is a string, but defensively reject numeric.
+        let body = Bytes::from(r#"{"id":42}"#);
+        assert!(parse_response_id(&body).is_none());
+    }
 }

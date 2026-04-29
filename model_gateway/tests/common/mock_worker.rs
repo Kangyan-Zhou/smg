@@ -4,7 +4,10 @@
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -31,6 +34,16 @@ pub struct MockWorkerConfig {
     pub health_status: HealthStatus,
     pub response_delay_ms: u64,
     pub fail_rate: f32,
+    /// Per-worker store of created diffusion task ids; mirrors the in-memory
+    /// store the real diffusion engine keeps.
+    pub diffusion_jobs: Arc<RwLock<HashSet<String>>>,
+    /// When true, every GET / DELETE / `/content` for a diffusion task returns
+    /// 404 regardless of whether this worker created the id. Used to exercise
+    /// the engine-restart eviction path.
+    pub diffusion_force_404: Arc<AtomicBool>,
+    /// Counter that disambiguates task ids created by this worker — so a test
+    /// can confirm which worker handled a POST without parsing the id back.
+    pub diffusion_task_counter: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Debug)]
@@ -103,6 +116,18 @@ impl MockWorker {
             )
             .route("/flush_cache", post(flush_cache_handler))
             .route("/v1/models", get(v1_models_handler))
+            .route(
+                "/v1/videos",
+                post(diffusion_video_create_handler).get(diffusion_video_list_handler),
+            )
+            .route(
+                "/v1/videos/{video_id}",
+                get(diffusion_video_get_handler).delete(diffusion_video_delete_handler),
+            )
+            .route(
+                "/v1/videos/{video_id}/content",
+                get(diffusion_video_content_handler),
+            )
             .with_state(config);
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -134,6 +159,12 @@ impl MockWorker {
 
         let url = format!("http://127.0.0.1:{port}");
         Ok(url)
+    }
+
+    /// Snapshot the current config — useful for tests that need to read the
+    /// per-worker diffusion job set or flip the `force_404` flag.
+    pub async fn config_snapshot(&self) -> MockWorkerConfig {
+        self.config.read().await.clone()
     }
 
     /// Stop the mock worker server
@@ -1320,6 +1351,131 @@ impl Default for MockWorkerConfig {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            diffusion_jobs: Arc::new(RwLock::new(HashSet::new())),
+            diffusion_force_404: Arc::new(AtomicBool::new(false)),
+            diffusion_task_counter: Arc::new(AtomicU64::new(0)),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Diffusion `/v1/videos` mock handlers — exercise the sticky-routing flow.
+// Each worker tracks its own task ids; a GET / DELETE / `/content` for a task
+// not in this worker's set returns 404, mirroring the real engine behaviour.
+// ---------------------------------------------------------------------------
+
+async fn diffusion_video_create_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    body: axum::body::Bytes,
+) -> Response {
+    let _ = body; // we don't validate the request shape in the mock
+    let config = config.read().await;
+    let worker_id = format!("worker-{}", config.port);
+    let counter = config
+        .diffusion_task_counter
+        .fetch_add(1, Ordering::Relaxed);
+    let task_id = format!("video-{}-{counter}", config.port);
+    config.diffusion_jobs.write().await.insert(task_id.clone());
+    (
+        StatusCode::OK,
+        [("x-worker-id", worker_id)],
+        Json(json!({
+            "id": task_id,
+            "object": "video",
+            "status": "queued",
+        })),
+    )
+        .into_response()
+}
+
+async fn diffusion_video_list_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+) -> Response {
+    let config = config.read().await;
+    let worker_id = format!("worker-{}", config.port);
+    let ids: Vec<String> = config.diffusion_jobs.read().await.iter().cloned().collect();
+    (
+        StatusCode::OK,
+        [("x-worker-id", worker_id)],
+        Json(json!({ "data": ids })),
+    )
+        .into_response()
+}
+
+async fn diffusion_video_get_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    Path(video_id): Path<String>,
+) -> Response {
+    let config = config.read().await;
+    let worker_id = format!("worker-{}", config.port);
+    let force_404 = config.diffusion_force_404.load(Ordering::Relaxed);
+    let known = !force_404 && config.diffusion_jobs.read().await.contains(&video_id);
+    if known {
+        (
+            StatusCode::OK,
+            [("x-worker-id", worker_id)],
+            Json(json!({ "id": video_id, "status": "completed" })),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            [("x-worker-id", worker_id)],
+            Json(json!({ "error": "Video not found" })),
+        )
+            .into_response()
+    }
+}
+
+async fn diffusion_video_delete_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    Path(video_id): Path<String>,
+) -> Response {
+    let config = config.read().await;
+    let worker_id = format!("worker-{}", config.port);
+    let removed = config.diffusion_jobs.write().await.remove(&video_id);
+    if removed {
+        (
+            StatusCode::OK,
+            [("x-worker-id", worker_id)],
+            Json(json!({ "id": video_id, "status": "deleted" })),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            [("x-worker-id", worker_id)],
+            Json(json!({ "error": "Video not found" })),
+        )
+            .into_response()
+    }
+}
+
+async fn diffusion_video_content_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    Path(video_id): Path<String>,
+) -> Response {
+    let config = config.read().await;
+    let worker_id = format!("worker-{}", config.port);
+    let force_404 = config.diffusion_force_404.load(Ordering::Relaxed);
+    let known = !force_404 && config.diffusion_jobs.read().await.contains(&video_id);
+    if known {
+        (
+            StatusCode::OK,
+            [
+                ("x-worker-id", worker_id),
+                ("content-type", "video/mp4".to_string()),
+            ],
+            // Tiny placeholder payload; real worker would stream the file.
+            axum::body::Bytes::from_static(b"\x00\x00fake-mp4"),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            [("x-worker-id", worker_id)],
+            Json(json!({ "error": "Video not found" })),
+        )
+            .into_response()
     }
 }

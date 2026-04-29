@@ -192,6 +192,7 @@ mod pd_routing_tests {
                     health_status: HealthStatus::Healthy,
                     response_delay_ms: 0,
                     fail_rate: 1.0, // Failing decode worker
+                    ..Default::default()
                 },
                 TestWorkerConfig::decode(19822), // Healthy decode worker
             ],
